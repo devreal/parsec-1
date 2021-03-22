@@ -266,22 +266,26 @@ mpi_funnelled_internal_get_am_callback(parsec_comm_engine_t *ce,
 
     pthread_mutex_lock(&array_of_requests_mtx);
 
-    pthread_mutex_lock(&array_of_requests_mtx);
-
     int post_in_static_array = mpi_funnelled_last_active_req < current_size_of_total_reqs;
     mpi_funnelled_dynamic_req_t *item;
 
     if(post_in_static_array) {
         cb = &array_of_callbacks[mpi_funnelled_last_active_req];
+        mpi_funnelled_last_active_req++;
+
         MPI_Isend(remote_memory_handle->mem, remote_memory_handle->count, remote_memory_handle->datatype,
-                  src, handshake_info->tag, parsec_ce_mpi_comm,
-                  &array_of_requests[mpi_funnelled_last_active_req]);
+                  src, handshake_info->tag, dep_comm,
+                  request);
     } else {
         item = (mpi_funnelled_dynamic_req_t *)parsec_thread_mempool_allocate(mpi_funnelled_dynamic_req_mempool->thread_mempools);
-        item->post_isend = 1;
+        //item->post_isend = 1;
+        item->post_isend = 0;
+        request = &item->request;
         cb = &item->cb;
     }
-
+    MPI_Isend(remote_memory_handle->mem, remote_memory_handle->count, remote_memory_handle->datatype,
+              src, handshake_info->tag, parsec_ce_mpi_comm,
+              &array_of_requests[mpi_funnelled_last_active_req]);
     /* we(the remote side) requested the source to forward us callback data that will be passed
      * to the callback function to notify upper level that the data has reached. We are copying
      * the callback data sent from the source.
