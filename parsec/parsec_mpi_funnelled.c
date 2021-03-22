@@ -1218,8 +1218,10 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
         MPI_Testsome(mpi_funnelled_last_active_req, array_of_requests,
                      &outcount, array_of_indices, array_of_statuses);
 
-        if(0 == outcount) goto feed_more_work;  /* can we push some more work? */
-
+        if(0 == outcount) {
+            pthread_mutex_unlock(&array_of_requests_mtx);
+            goto feed_more_work;  /* can we push some more work? */
+        }
         /* Trigger the callbacks */
         for( idx = 0; idx < outcount; idx++ ) {
             cb = &array_of_callbacks[array_of_indices[idx]];
