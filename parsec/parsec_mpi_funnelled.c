@@ -253,7 +253,7 @@ mpi_funnelled_internal_get_am_callback(parsec_comm_engine_t *ce,
                                        void *cb_data)
 {
     (void) ce; (void) tag; (void) cb_data;
-    assert(mpi_funnelled_last_active_req <= current_size_of_total_reqs);
+    //assert(mpi_funnelled_last_active_req <= current_size_of_total_reqs);
 
     mpi_funnelled_handshake_info_t *handshake_info = (mpi_funnelled_handshake_info_t *) msg;
     mpi_funnelled_callback_t *cb;
