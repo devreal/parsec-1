@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <pthread.h>
 #include "parsec/parsec_mpi_funnelled.h"
 #include "parsec/remote_dep.h"
 #include "parsec/class/parsec_hash_table.h"
