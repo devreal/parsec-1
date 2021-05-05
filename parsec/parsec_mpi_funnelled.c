@@ -486,6 +486,14 @@ static int mpi_funneled_init_once(parsec_context_t* context)
 
     assert(-1 == MAX_MPI_TAG);
 
+
+    pthread_mutexattr_t mutex_attr;
+
+    pthread_mutexattr_init(&mutex_attr);
+    pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&array_of_requests_mtx, &mutex_attr);
+    pthread_mutexattr_destroy(&mutex_attr);
+
     assert(MPI_COMM_NULL == parsec_ce_mpi_self_comm);
     MPI_Comm_dup(MPI_COMM_SELF, &parsec_ce_mpi_self_comm);
     assert(MPI_COMM_NULL == parsec_ce_mpi_comm);
