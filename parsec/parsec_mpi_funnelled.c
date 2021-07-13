@@ -579,6 +579,13 @@ mpi_funnelled_init(parsec_context_t *context)
     parsec_ce.capabilites.sided   = 2;
     parsec_ce.capabilites.supports_noncontiguous_datatype = 1;
 
+    int thread_provided;
+    MPI_Query_thread(&thread_provided);
+
+    if (MPI_THREAD_MULTIPLE == thread_provided) {
+        parsec_ce.capabilites.multithreaded = 1;
+    }
+
     /* Define some sensible values. We assume the application will initialize PaRSEC using
      * the entire MPI_COMM_WORLD, but we need to prepare some decent default values. */
     if( -1 == context->comm_ctx ) {
