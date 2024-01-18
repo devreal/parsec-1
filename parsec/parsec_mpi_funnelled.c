@@ -1265,6 +1265,7 @@ mpi_no_thread_push_posted_req(parsec_comm_engine_t *ce)
         item = (mpi_funnelled_dynamic_req_t *) parsec_list_nolock_pop_front(&mpi_funnelled_dynamic_sendreq_fifo);
     }
     if (NULL == item) {
+        pthread_mutex_unlock(&array_of_requests_mtx);
         return 0;
     }
 
