@@ -154,24 +154,23 @@ typedef struct mpi_funnelled_callback_s {
             parsec_ce_am_callback_t fct;
         } am;
         struct {
-            parsec_ce_onesided_callback_t fct;
-            parsec_ce_mem_reg_handle_t lreg; /* local memory handle */
-            ptrdiff_t ldispl; /* displacement for local memory handle */
-            parsec_ce_mem_reg_handle_t rreg; /* remote memory handle */
-            ptrdiff_t rdispl; /* displacement for remote memory handle */
-            size_t size; /* size of data */
-            int remote; /* remote process id */
-            int tag;
-        } onesided;
-        struct {
             parsec_ce_am_callback_t fct;
             void *msg;
         } onesided_mimic_am;
         struct {
-            // MPI_Isend(buf, size, MPI_BYTE, remote, tag, dep_comm, &req);
             void *buf;
         } am_send;
     } cb_type;
+    struct {
+        parsec_ce_onesided_callback_t fct;
+        parsec_ce_mem_reg_handle_t lreg; /* local memory handle */
+        ptrdiff_t ldispl; /* displacement for local memory handle */
+        parsec_ce_mem_reg_handle_t rreg; /* remote memory handle */
+        ptrdiff_t rdispl; /* displacement for remote memory handle */
+        size_t size; /* size of data */
+        int remote; /* remote process id */
+        int tag;
+    } onesided;
 } mpi_funnelled_callback_t;
 
 /* The internal communicators used by the CE to host its requests and
@@ -271,18 +270,14 @@ mpi_funnelled_internal_get_am_callback(parsec_comm_engine_t *ce,
 
     mpi_funnelled_handshake_info_t *handshake_info = (mpi_funnelled_handshake_info_t *) msg;
     mpi_funnelled_callback_t *cb;
-    MPI_Request *request;
-
-    mpi_funnelled_handshake_info_t *handshake_info = (mpi_funnelled_handshake_info_t *) msg;
-
+    MPI_Request request;
 
     /* This rank sent it's mem_reg in the activation msg, which is being
      * sent back as rreg of the msg */
     mpi_funnelled_mem_reg_handle_t *remote_memory_handle = (mpi_funnelled_mem_reg_handle_t *) (handshake_info->remote_memory_handle); /* This is the memory handle of the remote(our) side */
 
-    MPI_Request request;
     MPI_Isend(remote_memory_handle->mem, remote_memory_handle->count, remote_memory_handle->datatype,
-              src, handshake_info->tag, parsec_ce_mpi_comm, request);
+              src, handshake_info->tag, parsec_ce_mpi_comm, &request);
 
     pthread_mutex_lock(&array_of_requests_mtx);
 
@@ -298,7 +293,7 @@ mpi_funnelled_internal_get_am_callback(parsec_comm_engine_t *ce,
         item = (mpi_funnelled_dynamic_req_t *)parsec_thread_mempool_allocate(mpi_funnelled_dynamic_req_mempool->thread_mempools);
         //item->post_isend = 1;
         item->post_isend = 0;
-        item->request = req;
+        item->request = request;
         cb = &item->cb;
     }
 
@@ -364,9 +359,6 @@ mpi_funnelled_internal_put_am_callback(parsec_comm_engine_t *ce,
             ((char*)msg) + sizeof(mpi_funnelled_handshake_info_t),
             msg_size - sizeof(mpi_funnelled_handshake_info_t) );
 
-    assert(handshake_info->tag >= MIN_MPI_TAG);
-    assert(mpi_funnelled_last_active_req >= mpi_funnelled_static_req_idx);
-
     int _size;
     MPI_Type_size(remote_memory_handle->datatype, &_size);
 
@@ -374,7 +366,6 @@ mpi_funnelled_internal_put_am_callback(parsec_comm_engine_t *ce,
     MPI_Irecv(remote_memory_handle->mem, remote_memory_handle->count, remote_memory_handle->datatype,
               src, handshake_info->tag, parsec_ce_mpi_comm, &request);
 
-    int post_in_static_array = 1;
     mpi_funnelled_dynamic_req_t *item;
     pthread_mutex_lock(&array_of_requests_mtx);
     assert(mpi_funnelled_last_active_req >= mpi_funnelled_static_req_idx);
@@ -398,16 +389,6 @@ mpi_funnelled_internal_put_am_callback(parsec_comm_engine_t *ce,
         item->request = request;
         cb = &item->cb;
     }
-
-
-    /* we(the remote side) requested the source to forward us callback data that will be passed
-     * to the callback function to notify upper level that the data has reached. We are copying
-     * the callback data sent from the source.
-     */
-    void *callback_data = malloc(msg_size - sizeof(mpi_funnelled_handshake_info_t));
-    memcpy( callback_data,
-            ((char*)msg) + sizeof(mpi_funnelled_handshake_info_t),
-            msg_size - sizeof(mpi_funnelled_handshake_info_t) );
 
     /* We sent the pointer to the call back function for PUT over notification.
      * For a TRUE one sided this would be accomplished by an active message at
@@ -991,13 +972,10 @@ mpi_no_thread_put(parsec_comm_engine_t *ce,
     /*MPI_Isend((char *)ldata->mem + ldispl, ldata->size, MPI_BYTE, remote, tag, comm,
               &array_of_requests[mpi_funnelled_last_active_req]);*/
 
-    int post_in_static_array = 1;
     mpi_funnelled_dynamic_req_t *item;
 
     pthread_mutex_lock(&array_of_requests_mtx);
-    if(!(mpi_funnelled_last_active_req < size_of_total_reqs)) {
-        post_in_static_array = 0;
-    }
+    int post_in_static_array = mpi_funnelled_last_active_req < current_size_of_total_reqs;
 
     if(post_in_static_array) {
         cb = &array_of_callbacks[mpi_funnelled_last_active_req];
@@ -1081,19 +1059,19 @@ mpi_no_thread_get(parsec_comm_engine_t *ce,
     /* this is blocking, so using data on stack is not a problem */
     mpi_no_thread_send_active_message_impl(ce, PARSEC_CE_MPI_FUNNELLED_GET_TAG_INTERNAL, remote, buf, buf_size, true);
 
-    MPI_Request req;
-    parsec_profiling_ts_trace(mpi_irecv_enter_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
+    MPI_Request request;
+    //parsec_profiling_ts_trace(mpi_irecv_enter_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
     MPI_Irecv((char*)source_memory_handle->mem + ldispl, source_memory_handle->count, source_memory_handle->datatype,
               remote, tag, parsec_ce_mpi_comm, &request);
 
 
-    int post_in_static_array = 1;
     mpi_funnelled_dynamic_req_t *item;
     pthread_mutex_lock(&array_of_requests_mtx);
 
     assert(mpi_funnelled_last_active_req >= mpi_funnelled_static_req_idx);
 
-    if(MAX_NUM_RECV_REQ_IN_ARRAY >= mpi_funnelled_num_recv_req_in_arr) {
+    int post_in_static_array = mpi_funnelled_last_active_req < current_size_of_total_reqs;
+    if (MAX_NUM_RECV_REQ_IN_ARRAY >= mpi_funnelled_num_recv_req_in_arr) {
         post_in_static_array = 0;
     } else if (post_in_static_array) {
         mpi_funnelled_num_recv_req_in_arr++;
@@ -1169,15 +1147,15 @@ mpi_no_thread_send_active_message_impl(parsec_comm_engine_t *ce,
     assert(mpi_funnelled_last_active_req >= mpi_funnelled_static_req_idx);
 
     MPI_Request req;
-    parsec_profiling_ts_trace(mpi_isend_enter_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
+    //parsec_profiling_ts_trace(mpi_isend_enter_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
     MPI_Isend(buf, size, MPI_BYTE, remote, tag, parsec_ce_mpi_am_comm[tag], &req);
-    parsec_profiling_ts_trace(mpi_isend_exit_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
+    //parsec_profiling_ts_trace(mpi_isend_exit_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
 
     /* test once, put in queue if not complete */
-    int flag;
-    parsec_profiling_ts_trace(mpi_test_enter_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
+    int flag = 0;
+    //parsec_profiling_ts_trace(mpi_test_enter_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
     MPI_Test(&req, &flag, MPI_STATUS_IGNORE);
-    parsec_profiling_ts_trace(mpi_test_exit_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
+    //parsec_profiling_ts_trace(mpi_test_exit_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
     if (flag) {
         free(buf);
         return 1;
@@ -1206,7 +1184,7 @@ mpi_no_thread_send_active_message_impl(parsec_comm_engine_t *ce,
     cb->type     = MPI_FUNNELLED_TYPE_SENDAM;
 
     if(!post_in_static_array) {
-        parsec_list_nolock_push_back(&mpi_funnelled_dynamic_req_fifo,
+        parsec_list_nolock_push_back(&mpi_funnelled_dynamic_sendreq_fifo,
                                      (parsec_list_item_t *)item);
         /*if(mpi_funnelled_last_active_req < size_of_total_reqs) {
             assert(mpi_funnelled_last_active_req < size_of_total_reqs);
@@ -1274,20 +1252,31 @@ mpi_no_thread_push_posted_req(parsec_comm_engine_t *ce)
         pthread_mutex_unlock(&array_of_requests_mtx);
         return 0;
     }
-    mpi_funnelled_dynamic_req_t *item;
-    item = (mpi_funnelled_dynamic_req_t *) parsec_list_nolock_pop_front(&mpi_funnelled_dynamic_req_fifo);
+
+    mpi_funnelled_dynamic_req_t *item = NULL;
+    if (MAX_NUM_RECV_REQ_IN_ARRAY > mpi_funnelled_num_recv_req_in_arr) {
+        item = (mpi_funnelled_dynamic_req_t *) parsec_list_nolock_pop_front(&mpi_funnelled_dynamic_recvreq_fifo);
+        if (NULL != item) {
+            mpi_funnelled_num_recv_req_in_arr++;
+            item->cb.is_dynamic_recv = true;
+        }
+    }
+    if (NULL == item) {
+        item = (mpi_funnelled_dynamic_req_t *) parsec_list_nolock_pop_front(&mpi_funnelled_dynamic_sendreq_fifo);
+    }
+    if (NULL == item) {
+        return 0;
+    }
 
     if(item->post_isend) {
         pthread_mutex_unlock(&array_of_requests_mtx);
-        mpi_funnelled_mem_reg_handle_t *ldata = (mpi_funnelled_mem_reg_handle_t *) item->cb.cb_type.onesided.lreg;
-        MPI_Isend((char *)ldata->mem + item->cb.cb_type.onesided.ldispl, ldata->count,
-                  ldata->datatype, item->cb.cb_type.onesided.remote, item->cb.cb_type.onesided.size, parsec_ce_mpi_comm,
+        mpi_funnelled_mem_reg_handle_t *ldata = (mpi_funnelled_mem_reg_handle_t *) item->cb.onesided.lreg;
+        MPI_Isend((char *)ldata->mem + item->cb.onesided.ldispl, ldata->count,
+                  ldata->datatype, item->cb.onesided.remote, item->cb.onesided.size, parsec_ce_mpi_comm,
                   &item->request);
         pthread_mutex_lock(&array_of_requests_mtx);
     }
 
-
-    MPI_Request tmp = array_of_requests[mpi_funnelled_last_active_req];
     array_of_requests[mpi_funnelled_last_active_req] = item->request;
     item->request = MPI_REQUEST_NULL;
 
