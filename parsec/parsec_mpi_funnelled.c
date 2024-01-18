@@ -1272,7 +1272,7 @@ mpi_no_thread_push_posted_req(parsec_comm_engine_t *ce)
         pthread_mutex_unlock(&array_of_requests_mtx);
         mpi_funnelled_mem_reg_handle_t *ldata = (mpi_funnelled_mem_reg_handle_t *) item->cb.onesided.lreg;
         MPI_Isend((char *)ldata->mem + item->cb.onesided.ldispl, ldata->count,
-                  ldata->datatype, item->cb.onesided.remote, item->cb.onesided.size, parsec_ce_mpi_comm,
+                  ldata->datatype, item->cb.onesided.remote, item->cb.onesided.tag, parsec_ce_mpi_comm,
                   &item->request);
         pthread_mutex_lock(&array_of_requests_mtx);
     }
