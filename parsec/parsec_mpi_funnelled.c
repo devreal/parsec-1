@@ -187,6 +187,11 @@ typedef struct mpi_funnelled_callback_s {
             parsec_ce_am_callback_t fct;
             void *msg;
         } onesided_mimic_am;
+        struct {
+            int remote;
+            int tag;
+            int size;
+        } sendam;
     } cb_type;
     struct {
         parsec_ce_onesided_callback_t fct;
@@ -314,10 +319,10 @@ static void* worker_main(void* arg) {
     /* set up profiling */
     parsec_profiling_stream_t *es_profile = NULL;
     char *name;
-    asprintf(&name, "Comm worker %d", worker_id);
+    asprintf(&name, "Comm thread %d", worker_id);
     es_profile = parsec_profiling_stream_init( 2*1024*1024, name);
     parsec_profiling_set_default_thread(es_profile);
-    assert(es_profile != NULL);
+    //assert(es_profile != NULL);
     free(name);
 #endif // PARSEC_PROF_TRACE
 
@@ -807,6 +812,8 @@ mpi_funnelled_fini(parsec_comm_engine_t *ce)
         parsec_mempool_destruct(mpi_funnelled_mem_reg_handle_mempool);
         free(mpi_funnelled_mem_reg_handle_mempool); mpi_funnelled_mem_reg_handle_mempool = NULL;
 
+        printf("mpi_funnelled_dynamic_req_mempool elements %zu\n", mpi_funnelled_dynamic_req_mempool->thread_mempools->nb_elt);
+
         parsec_mempool_destruct(mpi_funnelled_dynamic_req_mempool);
         free(mpi_funnelled_dynamic_req_mempool); mpi_funnelled_dynamic_req_mempool = NULL;
     }
@@ -1290,7 +1297,7 @@ mpi_no_thread_send_active_message_impl(parsec_comm_engine_t *ce,
         buf = (void*)(((intptr_t)item) + DYNAMIC_REQ_PAYLOAD_OFFSET);
         buf_allocated = false;
     } else {
-        printf("AM total_size %zu > payload size %zu\n", total_size, DYNAMIC_REQ_PAYLOAD_SIZE);
+        //printf("AM total_size %zu > payload size %zu\n", total_size, DYNAMIC_REQ_PAYLOAD_SIZE);
         buf = malloc(total_size);
         buf_allocated = true;
     }
@@ -1308,15 +1315,20 @@ mpi_no_thread_send_active_message_impl(parsec_comm_engine_t *ce,
     //parsec_profiling_ts_trace(mpi_isend_enter_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
 
     //printf("AM MPI_Isend %zu B\n", size);
-    TRACE_SENDRECV_INFO(parsec_mpi_isend_start_key, tag, total_size, remote);
-    MPI_Isend(buf, total_size, MPI_BYTE, remote, tag, parsec_ce_mpi_am_comm[tag], &req);
-    TRACE(parsec_mpi_isend_end_key);
+    bool post_immediate = false;
+    if (!buf_allocated) {
+        TRACE_SENDRECV_INFO(parsec_mpi_isend_start_key, tag, total_size, remote);
+        MPI_Isend(buf, total_size, MPI_BYTE, remote, tag, parsec_ce_mpi_am_comm[tag], &req);
+        TRACE(parsec_mpi_isend_end_key);
+        post_immediate = true;
+    }
     //parsec_profiling_ts_trace(mpi_isend_exit_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
 
     /* test once, put in queue if not complete */
     int flag = 0;
     //parsec_profiling_ts_trace(mpi_test_enter_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
-    MPI_Test(&req, &flag, MPI_STATUS_IGNORE);
+    // TODO: do we want to test here?
+    //MPI_Test(&req, &flag, MPI_STATUS_IGNORE);
     //parsec_profiling_ts_trace(mpi_test_exit_key, 0, PROFILE_OBJECT_ID_NULL, NULL);
     if (flag) {
         parsec_thread_mempool_free(mpi_funnelled_dynamic_req_mempool->thread_mempools, item);
@@ -1326,7 +1338,7 @@ mpi_no_thread_send_active_message_impl(parsec_comm_engine_t *ce,
         return 1;
     }
 
-    item->post_isend = 0;
+    item->post_isend = !post_immediate;
     item->request = req;
     cb = &item->cb;
     cb->storage1 = mpi_funnelled_last_active_req;
@@ -1335,11 +1347,20 @@ mpi_no_thread_send_active_message_impl(parsec_comm_engine_t *ce,
     cb->dynamic_req = item;
     cb->type     = MPI_FUNNELLED_TYPE_SENDAM;
     cb->free_cb_data = buf_allocated;
+    cb->cb_type.sendam.size = total_size;
+    cb->cb_type.sendam.tag = tag;
+    cb->cb_type.sendam.remote = remote;
+
 
     /* need to take the lock here */
     pthread_mutex_lock(&array_of_requests_mtx);
-    parsec_list_nolock_push_back(&mpi_funnelled_dynamic_sendamreq_fifo,
-                                 (parsec_list_item_t *)item);
+    if (!post_immediate) {
+        parsec_list_nolock_push_back(&mpi_funnelled_dynamic_sendreq_fifo,
+                                     (parsec_list_item_t *)item);
+    } else {
+        parsec_list_nolock_push_back(&mpi_funnelled_dynamic_sendamreq_fifo,
+                                     (parsec_list_item_t *)item);
+    }
     pthread_mutex_unlock(&array_of_requests_mtx);
 
     return 1;
@@ -1432,11 +1453,31 @@ mpi_no_thread_push_posted_req(parsec_comm_engine_t *ce)
 
         if(item->post_isend) {
             pthread_mutex_unlock(&array_of_requests_mtx);
-            mpi_funnelled_mem_reg_handle_t *ldata = (mpi_funnelled_mem_reg_handle_t *) item->cb.onesided.lreg;
-            TRACE_SENDRECV_INFO(parsec_mpi_isend_start_key, item->cb.onesided.tag, ldata->count, item->cb.onesided.remote);
-            MPI_Isend((char *)ldata->mem + item->cb.onesided.ldispl, ldata->count,
-                      ldata->datatype, item->cb.onesided.remote, item->cb.onesided.tag, parsec_ce_mpi_comm,
-                      &item->request);
+            int tag, count, remote;
+            void *ptr;
+            MPI_Comm comm;
+            MPI_Datatype dtype;
+            if (item->cb.type == MPI_FUNNELLED_TYPE_SENDAM) {
+                tag = item->cb.cb_type.sendam.tag;
+                count = item->cb.cb_type.sendam.size;
+                remote = item->cb.cb_type.sendam.remote;
+                ptr = item->cb.cb_data;
+                comm = parsec_ce_mpi_am_comm[tag];
+                dtype = MPI_BYTE;
+            } else {
+                mpi_funnelled_mem_reg_handle_t *ldata = (mpi_funnelled_mem_reg_handle_t *) item->cb.onesided.lreg;
+                tag = item->cb.onesided.tag;
+                count = ldata->count;
+                remote = item->cb.onesided.remote;
+                ptr = (char *)ldata->mem + item->cb.onesided.ldispl;
+                comm = parsec_ce_mpi_comm;
+                dtype = ldata->datatype;
+            }
+            TRACE_SENDRECV_INFO(parsec_mpi_isend_start_key, tag, count, remote);
+            MPI_Isend(ptr, count, dtype, remote, tag, comm, &item->request);
+            //MPI_Isend((char *)ldata->mem + item->cb.onesided.ldispl, ldata->count,
+            //          ldata->datatype, item->cb.onesided.remote, item->cb.onesided.tag, parsec_ce_mpi_comm,
+            //          &item->request);
             TRACE(parsec_mpi_isend_end_key);
             pthread_mutex_lock(&array_of_requests_mtx);
         }
