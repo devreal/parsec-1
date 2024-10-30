@@ -156,6 +156,37 @@ int parsec_runtime_keep_highest_priority_task = 1;
 
 static PARSEC_TLS_DECLARE(parsec_tls_execution_stream);
 
+#ifdef PARSEC_HAVE_NOSV
+
+#include <nosv.h>
+
+static PARSEC_TLS_DECLARE(parsec_tls_nosv_task);
+static inline void thread_schedule_init() {
+    PARSEC_TLS_KEY_CREATE(parsec_tls_nosv_task);
+}
+static inline void thread_schedule_attach(const char *name) {
+    nosv_task_t *task;
+    int rc = nosv_attach(&task, NULL, name, NOSV_ATTACH_NONE);
+    if (rc != 0) {
+        parsec_warning("Failed to attach thread to NOS-V (%d)", rc);
+    }
+    PARSEC_TLS_SET_SPECIFIC(parsec_tls_nosv_task, task);
+}
+
+static inline void thread_schedule_detach() {
+    nosv_task_t *task = (nosv_task_t*)PARSEC_TLS_GET_SPECIFIC(parsec_tls_nosv_task);
+    int rc = nosv_detach(NOSV_DETACH_NONE);
+    if (rc != 0) {
+        parsec_warning("Failed to detach thread to NOS-V (%d)", rc);
+    }
+    PARSEC_TLS_SET_SPECIFIC(parsec_tls_nosv_task, NULL);
+}
+#else  // PARSEC_HAVE_NOSV
+static inline void thread_schedule_init() { }
+static inline void thread_schedule_attach(const char *name) { }
+static inline void thread_schedule_detach() { }
+#endif // PARSEC_HAVE_NOSV
+
 #if defined(DISTRIBUTED) && defined(PARSEC_HAVE_MPI)
 static void parsec_mpi_exit(int status) {
     MPI_Abort(MPI_COMM_WORLD, status);
@@ -265,6 +296,9 @@ static void* __parsec_thread_init( __parsec_temporary_thread_initialization_t* s
     gettimeofday(&tv_now, NULL);
 
     PARSEC_TLS_SET_SPECIFIC(parsec_tls_execution_stream, es);
+    char thread_name[128];
+    snprintf(thread_name, sizeof(thread_name), "parsec worker %d", startup->th_id);
+    thread_schedule_attach(thread_name);
 
     es->th_id            = startup->th_id;
     es->virtual_process  = startup->virtual_process;
@@ -345,6 +379,7 @@ static void* __parsec_thread_init( __parsec_temporary_thread_initialization_t* s
 
     void *ret = (void*)(long)__parsec_context_wait(es);
     PARSEC_PAPI_SDE_THREAD_FINI();
+    thread_schedule_detach();
     return ret;
 }
 
@@ -853,6 +888,7 @@ parsec_context_t* parsec_init( int nb_cores, int* pargc, char** pargv[] )
     }
 
     __parsec_thread_init( &startup[0] );
+    thread_schedule_attach("main thread");
 
     /* Wait until all threads are done binding themselves */
     parsec_barrier_wait( &(context->barrier) );
@@ -1225,7 +1261,7 @@ int parsec_fini( parsec_context_t** pcontext )
 #endif  /* PARSEC_PROF_TRACE */
 
     /* PAPI SDE needs to process the shutdown before resources exposed to it are freed.
-     * This includes scheduling resources, so SDE needs to be finalized before the 
+     * This includes scheduling resources, so SDE needs to be finalized before the
      * computation threads leave */
     PARSEC_PAPI_SDE_FINI();
 
@@ -1552,7 +1588,7 @@ parsec_update_deps_with_counter(parsec_taskpool_t *tp,
     (void)origin;
     (void)origin_flow;
     (void)dest_flow;
-    
+
     if( 0 == *deps ) {
         dep_new_value = parsec_check_IN_dependencies_with_counter(tp, task) - 1;
         if( parsec_atomic_cas_int32( deps, 0, dep_new_value ) == 1 )

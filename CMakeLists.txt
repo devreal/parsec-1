@@ -17,7 +17,7 @@ include(GNUInstallDirs)
 #   When making a backward incompabilte change to an API (or exposed structure)
 #     PARSEC_VERSION_MAJOR increases by 1
 #     PARSEC_VERSION_MINOR resets to 0
-# Unlike strict libtool numbering, PARSEC_VERSION_RELEASE is an monotonous 
+# Unlike strict libtool numbering, PARSEC_VERSION_RELEASE is an monotonous
 # increasing number that corresponds to the software version release number
 # and never resets to 0, where
 #   YY is the last 2 digits of the release year,
@@ -790,6 +790,14 @@ int main(int argc, char *argv[]) {
         "-undefined dynamic_lookup")
     endif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
   endif(AYUDAME_FOUND)
+
+  pkg_check_modules(NOSV REQUIRED nos-v)
+  set(PARSEC_HAVE_NOSV ${NOSV_FOUND})
+  if (NOSV_FOUND)
+    include_directories(${NOSV_INCLUDE_DIRS})
+    link_directories(${NOSV_LIBRARY_DIRS})
+    link_libraries(${NOSV_LIBRARIES})
+  endif (NOSV_FOUND)
 
   # Coerce CMake to install the generated .mod files
   if(CMAKE_Fortran_COMPILER_WORKS)
