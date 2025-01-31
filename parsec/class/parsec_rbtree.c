@@ -278,42 +278,63 @@ parsec_rbtree_node_t* parsec_rbtree_find_or_larger(parsec_rbtree_t *tree, int da
     return larger; // data not found
 }
 
-
-int parsec_rbtree_update_node(parsec_rbtree_t *tree, parsec_rbtree_node_t *node, int newdata)
-{
-    bool needs_reinsert = false;
-    parsec_rbtree_node_t *parent = node->parent;
-    /* check whether parent and left/right nodes would still be in the right place */
-    if (parent != tree->nil) {
-        if (LEFT(parent) == node && COMPARISON_VAL(parent, tree->comp_offset) <= newdata) {
-            if (COMPARISON_VAL(parent, tree->comp_offset) == newdata) {
-                return PARSEC_ERR_EXISTS;
-            }
-            needs_reinsert = true; // node grew past the parent
-        } else if (RIGHT(parent) == node && COMPARISON_VAL(parent, tree->comp_offset) > newdata) {
-            /* no need to check for equality again here */
-            needs_reinsert = true; // node shrunk past the parent
-        } else if (LEFT(node) != tree->nil && COMPARISON_VAL(LEFT(node), tree->comp_offset) >= newdata) {
-            if (COMPARISON_VAL(LEFT(node), tree->comp_offset) == newdata) {
-                return PARSEC_ERR_EXISTS;
-            }
-            needs_reinsert = true; // node shrunk past its left child
-        } else if (RIGHT(node) != tree->nil && COMPARISON_VAL(RIGHT(node), tree->comp_offset) < newdata) {
-            if (COMPARISON_VAL(RIGHT(node), tree->comp_offset) == newdata) {
-                return PARSEC_ERR_EXISTS;
-            }
-            needs_reinsert = true; // node grew past its right child
+int parsec_rbtree_update_node(parsec_rbtree_t *tree, parsec_rbtree_node_t *node, int newdata) {
+    parsec_rbtree_node_t *left = LEFT(node);
+    parsec_rbtree_node_t *right = RIGHT(node);
+    bool needs_reinsert = true;
+    do {
+        if (left != tree->nil && COMPARISON_VAL(left, tree->comp_offset) >= newdata) {
+            /* left child is now larger or equal so reinsert */
+            break;
         }
-
-        if (needs_reinsert) {
-            /* remove and reinsert to ensure balancing */
-            parsec_rbtree_remove(tree, node);
-            COMPARISON_VAL(node, tree->comp_offset) = newdata;
-            parsec_rbtree_insert(tree, node);
-        } else {
-            /* simply update the node value */
-            COMPARISON_VAL(node, tree->comp_offset) = newdata;
+        if (right != tree->nil && COMPARISON_VAL(right, tree->comp_offset) <= newdata) {
+            /* right child is now larger or equal so reinsert */
+            break;
         }
+        if (node->parent != tree->nil) {
+            /**
+             * Walk up the tree until we find one of the following:
+             * 1) An ancestor has the same value as the new data. We need to reinsert.
+             * 2) The node was a left child, an ancestor is smaller than the new data,
+             *    and we're hanging off its right side (i.e., ordering is still correct).
+             * 3) The node was a right child, an ancestor is larger than the new data,
+             *    and we're hanging off its left side (i.e., ordering is still correct).
+             */
+            bool was_left_child = (LEFT(node->parent) == node);
+            parsec_rbtree_node_t *tmp_node = node;
+            parsec_rbtree_node_t *tmp_parent;
+            do {
+                tmp_parent = tmp_node->parent;
+                int parent_data = COMPARISON_VAL(tmp_parent, tree->comp_offset);
+                if (parent_data == newdata) {
+                    /* the new data equals that of a parent node so we need to rebalance */
+                    break;
+                } else if (was_left_child &&
+                        RIGHT(tmp_parent) == tmp_node &&
+                        parent_data < newdata) {
+                    /* The node value was smaller than its parent, we found an ancestor
+                    * that is smaller than the new value, and we're on the right side
+                    * of the ancestor. No reinserting needed. */
+                    needs_reinsert = false;
+                    break;
+                } else if (LEFT(tmp_parent) == tmp_node &&
+                        parent_data > newdata) {
+                    /* The node value was larger than its parent, we found an ancestor
+                    * that is larger than the new value, and we're on the left side
+                    * of the ancestor. No reinserting needed. */
+                    needs_reinsert = false;
+                    break;
+                }
+                tmp_node = tmp_parent;
+            } while (tmp_parent != tree->root);
+        }
+    } while (0);
+    if (needs_reinsert) {
+        parsec_rbtree_remove(tree, node);
+        COMPARISON_VAL(node, tree->comp_offset) = newdata;
+        parsec_rbtree_insert(tree, node);
+    } else {
+        COMPARISON_VAL(node, tree->comp_offset) = newdata;
     }
 
     return PARSEC_SUCCESS;
