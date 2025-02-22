@@ -420,6 +420,7 @@ void parsec_device_release_gpu_copy(parsec_device_gpu_module_t* gpu_device, pars
     }
 #endif // PARSEC_PROF_TRACE
 
+#if 0
 #if defined(PARSEC_GPU_ALLOC_PER_TILE)
 	gpu_device->memory_free( gpu_copy->device_private );
     gpu_copy->device_private = NULL;
@@ -428,6 +429,7 @@ void parsec_device_release_gpu_copy(parsec_device_gpu_module_t* gpu_device, pars
     zone_free( gpu_device->memory, (void*)(gpu_copy->device_private) );
     gpu_copy->device_private = NULL;
 #endif // PARSEC_GPU_ALLOC_PER_TILE
+#endif // 0
     PARSEC_DATA_COPY_RELEASE(gpu_copy);
     assert( NULL == gpu_copy );
 }
@@ -835,7 +837,7 @@ static void parsec_device_memory_release_list(parsec_device_gpu_module_t* gpu_de
          * before we get here (aka below parsec_fini), the destructor of the data
          * collection must have been called, releasing all the copies.
          */
-        parsec_device_release_gpu_copy(gpu_device, gpu_copy);
+        PARSEC_DATA_COPY_RELEASE(gpu_copy); assert(NULL == gpu_copy);
     }
 }
 
@@ -1249,7 +1251,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                                  gpu_device->super.device_index, gpu_device->super.name, task_name,
                                  lru_gpu_elem, lru_gpu_elem->device_private, lru_gpu_elem->super.super.obj_reference_count,
                                  oldmaster);
-            parsec_device_release_gpu_copy(gpu_device, lru_gpu_elem);
+            //parsec_device_release_gpu_copy(gpu_device, lru_gpu_elem);
             data_avail_epoch++;
             PARSEC_DEBUG_VERBOSE(30, parsec_gpu_output_stream,
                                  "GPU[%d:%s]:%s: Release LRU-retrieved GPU copy %p [ref_count %d: must be 1]",
