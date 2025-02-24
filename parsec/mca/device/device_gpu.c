@@ -1191,6 +1191,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                              gpu_device->super.device_index, gpu_device->super.name, task_name,
                              gpu_elem, gpu_elem->super.super.obj_reference_count);
         assert(0 != (gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) );
+        assert(master->device_copies[0]->coherency_state != PARSEC_DATA_COHERENCY_INVALID);
         parsec_atomic_unlock(&master->lock);
     }
     if( data_avail_epoch ) {
@@ -2402,6 +2403,11 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
 
         /* If it is a copy managed by the user, don't bother either */
         if( 0 == (gpu_copy->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) ) continue;
+
+        /* Don't mess with the host copy if it's not allocated */
+        if ( NULL == cpu_copy->device_private ) {
+            continue;
+        }
 
         /**
          * There might be a race condition here. We can't assume the first CPU
