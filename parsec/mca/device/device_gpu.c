@@ -420,9 +420,12 @@ void parsec_device_release_gpu_copy(parsec_device_gpu_module_t* gpu_device, pars
                                      gpu_device->super.device_index, NULL, 0);
     }
 #endif // PARSEC_PROF_TRACE
-    assert( 0 != (gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) );
-    zone_free( gpu_device->memory, (void*)(gpu_elem->device_private) );
-    gpu_elem->device_private = NULL;
+    if (0 != (gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED)) {
+        //assert( 0 != (gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) );
+        assert(gpu_elem->device_private != NULL);
+        zone_free( gpu_device->memory, (void*)(gpu_elem->device_private) );
+        gpu_elem->device_private = NULL;
+    }
     PARSEC_OBJ_RELEASE(gpu_elem);
     assert( NULL == gpu_elem );
 #endif // PARSEC_GPU_ALLOC_PER_TILE
