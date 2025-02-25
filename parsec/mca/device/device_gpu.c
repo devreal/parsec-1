@@ -1211,7 +1211,8 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                              gpu_device->super.device_index, gpu_device->super.name, task_name,
                              gpu_elem, gpu_elem->super.super.obj_reference_count);
         assert(0 != (gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) );
-        assert(master->device_copies[0]->coherency_state != PARSEC_DATA_COHERENCY_INVALID);
+        assert(master->device_copies[0]->device_private == NULL ||
+               master->device_copies[0]->coherency_state != PARSEC_DATA_COHERENCY_INVALID);
         parsec_atomic_unlock(&master->lock);
     }
     if( data_avail_epoch ) {
