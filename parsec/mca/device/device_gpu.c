@@ -2424,11 +2424,6 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
         /* If it is a copy managed by the user, don't bother either */
         if( 0 == (gpu_copy->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) ) continue;
 
-        /* Don't mess with the host copy if it's not allocated */
-        if ( NULL == cpu_copy->device_private ) {
-            continue;
-        }
-
         /**
          * There might be a race condition here. We can't assume the first CPU
          * version is the corresponding CPU copy, as a new CPU-bound data
@@ -2444,10 +2439,13 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
          *        same state as the GPU to prevent an extra data movement.
          */
         assert( PARSEC_DATA_COHERENCY_OWNED == gpu_copy->coherency_state );
-        gpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
-        cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
 
-        cpu_copy->version = gpu_copy->version;
+        /* Don't mess with the host copy if it's not allocated */
+        if ( NULL != cpu_copy->device_private ) {
+            gpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
+            cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
+            cpu_copy->version = gpu_copy->version;
+        }
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
                              "GPU[%d:%s]: CPU copy %p [ref_count %d] gets the same version %d as GPU copy %p [ref_count %d]",
                              gpu_device->super.device_index, gpu_device->super.name,
