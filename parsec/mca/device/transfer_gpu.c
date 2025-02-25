@@ -241,6 +241,7 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
     parsec_gpu_data_copy_t *gpu_copy, *cpu_copy;
     parsec_list_item_t* item = (parsec_list_item_t*)gpu_device->gpu_mem_owned_lru.ghost_element.list_next;
     int nb_cleaned = 0;
+    int nb_discarded = 0;
 
     /* Find a data copy that has no pending users on the GPU, and can be
      * safely moved back on the main memory */
@@ -262,6 +263,7 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
                                  gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->original);
             parsec_atomic_unlock( &gpu_copy->original->lock );
             parsec_device_release_gpu_copy(gpu_device, gpu_copy);
+            nb_discarded++;
         } else if( 0 == gpu_copy->readers ) {
             if( PARSEC_UNLIKELY(NULL == d2h_task) ) {  /* allocate on-demand */
                 d2h_task = (parsec_gpu_d2h_task_t*)parsec_thread_mempool_allocate(es->context_mempool);
@@ -286,6 +288,10 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
         } else {
             parsec_atomic_unlock( &gpu_copy->original->lock );
         }
+    }
+
+    if (nb_discarded > 0) {
+        parsec_atomic_fetch_sub_int64(&gpu_device->super.nb_discarded, nb_discarded);
     }
 
     if( 0 == nb_cleaned )

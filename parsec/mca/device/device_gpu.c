@@ -2462,7 +2462,7 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
 
         if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) {
             PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
-                                 "GPU[%d:%s] Release GPU copy %p (device_ptr %p) [ref_count %d: must be 1], attached to %p",
+                                 "GPU[%d:%s] Release discarded GPU copy %p (device_ptr %p) [ref_count %d: must be 1], attached to %p",
                                  gpu_device->super.device_index, gpu_device->super.name,
                                  gpu_copy, gpu_copy->device_private, gpu_copy->super.super.obj_reference_count,
                                  original);
