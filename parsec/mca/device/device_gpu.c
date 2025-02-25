@@ -765,12 +765,11 @@ static int parsec_device_memory_release_discarded(parsec_device_gpu_module_t* gp
         return 0;
     }
 
-    while (NULL != (item = parsec_list_pop_front(list))) {
+    while (NULL != (item = parsec_list_nolock_pop_front(list))) {
         parsec_gpu_data_copy_t* gpu_copy = (parsec_gpu_data_copy_t*)item;
         parsec_data_t* original = gpu_copy->original;
         if (NULL != original) {
             parsec_data_copy_t *cpu_copy = original->device_copies[0];
-            parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
             PARSEC_LIST_ITEM_SINGLETON(item);
 
             if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) {
@@ -778,11 +777,13 @@ static int parsec_device_memory_release_discarded(parsec_device_gpu_module_t* gp
                 parsec_device_release_gpu_copy(gpu_device, gpu_copy);
                 PARSEC_DEBUG_VERBOSE(30, parsec_gpu_output_stream,
                                     "Releasing discarded GPU copy %p from data %p", gpu_copy, original);
-            } else if (ring == NULL) {
-                ring = item;
-            } else {
-                parsec_list_item_ring_push(ring, item);
+                continue;
             }
+        }
+        if (ring == NULL) {
+            ring = item;
+        } else {
+            parsec_list_item_ring_push(ring, item);
         }
     }
     /* put the ring back into the list */
@@ -2659,6 +2660,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
 
         /* try to release all discarded copies and try again if succesful */
         if (0 < parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_owned_lru)) {
+            gpu_task = NULL;
             goto check_in_deps;
         }
 
