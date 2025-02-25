@@ -871,13 +871,13 @@ parsec_list_nolock_push_sorted( parsec_list_t* list,
         parsec_list_nolock_push_front(list, newel);
     } else {
         /* take the range of priorities and decide whether to iterate forward or backward */
-        int tail_val = COMPARISON_VAL(_TAIL(list), off);
-        int head_val = COMPARISON_VAL(_HEAD(list), off);
-        int comp_val = COMPARISON_VAL(newel, off);
+        int64_t tail_val = COMPARISON_VAL(_TAIL(list), off);
+        int64_t head_val = COMPARISON_VAL(_HEAD(list), off);
+        int64_t comp_val = COMPARISON_VAL(newel, off);
         /* compute the pivot without risking overflow
          * first, we compute the half point from the head and tail
          * second, we account for odd numbers by adding 1 if both were odd */
-        int pivot = (head_val/2) + (tail_val/2) + (((head_val%2) + (tail_val%2))) == 2 ? 1 : 0;
+        int64_t pivot = (head_val/2) + (tail_val/2) + (((head_val%2) + (tail_val%2)) == 2 ? 1 : 0);
         if (comp_val > pivot) {
             /* new element is in upper half of priority range */
             parsec_list_item_t* position = PARSEC_LIST_NOLOCK_ITERATOR(list, pos,
