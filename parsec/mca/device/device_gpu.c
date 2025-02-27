@@ -1610,19 +1610,6 @@ parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
     return 1;  /* positive returns have special meaning and are used for optimizations */
 }
 
-#if PARSEC_GPU_USE_PRIORITIES
-
-static inline parsec_list_item_t* parsec_device_push_task_ordered( parsec_list_t* list,
-                                                                   parsec_list_item_t* elem )
-{
-    parsec_list_push_sorted(list, elem, parsec_execution_context_priority_comparator);
-    return elem;
-}
-#define PARSEC_PUSH_TASK parsec_device_push_task_ordered
-#else
-#define PARSEC_PUSH_TASK parsec_list_push_back
-#endif
-
 static parsec_flow_t parsec_device_d2d_complete_flow = {
     .name = "D2D FLOW",
     .flow_flags = PARSEC_FLOW_ACCESS_READ,
@@ -1937,11 +1924,14 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
     char task_str[MAX_TASK_STRLEN];
 #endif
 
-    /* We always handle the tasks in order. Thus if we got a new task, add it to the
-     * local list (possibly by reordering the list). Also, as we can return a single
-     * task first try to see if anything completed. */
+    /* We prioritize internal tasks by pushing them to the front of the queue.
+     * Kernels will be handled in the order in which they arrive. */
     if( NULL != task ) {
-        PARSEC_PUSH_TASK(stream->fifo_pending, (parsec_list_item_t*)task);
+        if (task->task_type != PARSEC_GPU_TASK_TYPE_KERNEL) {
+            parsec_list_push_front(stream->fifo_pending, (parsec_list_item_t*)task);
+        } else {
+            parsec_list_push_back(stream->fifo_pending, (parsec_list_item_t*)task);
+        }
         task = NULL;
     }
     *out_task = NULL;
