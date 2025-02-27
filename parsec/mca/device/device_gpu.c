@@ -911,6 +911,9 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
     int i, j, data_avail_epoch = 0, copy_readers_update = 0;
     parsec_gpu_data_copy_t *gpu_mem_lru_cycling = NULL;
 
+    /* defensive (valgrind reported uninitialized accesses to temp_loc)*/
+    memset(temp_loc, 0, sizeof(temp_loc));
+
 #if defined(PARSEC_DEBUG_NOISIER)
     char task_name[MAX_TASK_STRLEN];
     parsec_task_snprintf(task_name, MAX_TASK_STRLEN, this_task);
