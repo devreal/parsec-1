@@ -2265,7 +2265,7 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
             /* Do not propagate GPU copies to successors (temporary solution) */
             this_task->data[i].data_out = original->device_copies[0];
             PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
-                                 "GPU[%d:%s]: pop %s swap %d GPU read-only data_out %p [ref_count %d] with the corresponding CPU copy %p [ref_count %d] original %p",
+                                 "GPU[%d:%s]: pop %s swap flow %d GPU read-only data_out %p [ref_count %d] with the corresponding CPU copy %p [ref_count %d] original %p",
                                  gpu_device->super.device_index, gpu_device->super.name,
                                      parsec_task_snprintf(tmp, MAX_TASK_STRLEN, this_task), i,
                                      gpu_copy, gpu_copy->super.super.obj_reference_count,
@@ -2437,11 +2437,16 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
             gpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
             cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
             cpu_copy->version = gpu_copy->version;
+            PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
+                                "GPU[%d:%s]: CPU copy %p [ref_count %d] gets the same version %d as GPU copy %p [ref_count %d]",
+                                gpu_device->super.device_index, gpu_device->super.name,
+                                cpu_copy, cpu_copy->super.super.obj_reference_count, cpu_copy->version, gpu_copy, gpu_copy->super.super.obj_reference_count);
+        } else {
+            PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
+                                "GPU[%d:%s]: CPU copy %p [ref_count %d] version not updated to %d of GPU copy %p [ref_count %d] because no host data allocated",
+                                gpu_device->super.device_index, gpu_device->super.name,
+                                cpu_copy, cpu_copy->super.super.obj_reference_count, cpu_copy->version, gpu_copy, gpu_copy->super.super.obj_reference_count);
         }
-        PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
-                             "GPU[%d:%s]: CPU copy %p [ref_count %d] gets the same version %d as GPU copy %p [ref_count %d]",
-                             gpu_device->super.device_index, gpu_device->super.name,
-                             cpu_copy, cpu_copy->super.super.obj_reference_count, cpu_copy->version, gpu_copy, gpu_copy->super.super.obj_reference_count);
 
         /**
          * Let's lie to the engine by reporting that working version of this
