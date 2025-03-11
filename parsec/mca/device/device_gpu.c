@@ -1215,8 +1215,9 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                              gpu_device->super.device_index, gpu_device->super.name, task_name,
                              gpu_elem, gpu_elem->super.super.obj_reference_count);
         assert(0 != (gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) );
-        assert(master->device_copies[0]->device_private == NULL ||
-               master->device_copies[0]->coherency_state != PARSEC_DATA_COHERENCY_INVALID);
+        // TODO: is this assert right?
+        //assert(master->device_copies[0]->device_private == NULL ||
+        //       master->device_copies[0]->coherency_state != PARSEC_DATA_COHERENCY_INVALID);
         parsec_atomic_unlock(&master->lock);
     }
     if( data_avail_epoch ) {
@@ -1314,8 +1315,12 @@ parsec_default_gpu_stage_out(parsec_gpu_task_t        *gtask,
                 dir = parsec_device_gpu_transfer_direction_d2h;
                 if (dest->device_private == NULL && dest->alloc_cb != NULL) {
                     dest->alloc_cb(dest, 0); // allocate on host
+                    PARSEC_DEBUG_VERBOSE(5, parsec_gpu_output_stream,
+                                         "GPU[%d:%s]: Allocated host memory for CPU copy %p data %p ptr %p",
+                                         src_dev->super.device_index, src_dev->super.name, dest, source->original, dest->device_private);
                 }
                 if (dest->device_private == NULL) {
+                    parsec_warning("Application failed to allocate host memory for pushout data %p copy %p!", source->original, dest);
                     return PARSEC_HOOK_RETURN_ERROR;
                 }
             }
@@ -1725,10 +1730,10 @@ parsec_device_callback_complete_push(parsec_device_gpu_module_t   *gpu_device,
         if(PARSEC_DATA_STATUS_UNDER_TRANSFER == task->data[i].data_out->data_transfer_status ) {
             /* only the task who did the PUSH can modify the status */
             parsec_atomic_lock(&task->data[i].data_out->original->lock);
-            task->data[i].data_out->data_transfer_status = PARSEC_DATA_STATUS_COMPLETE_TRANSFER;
             parsec_data_end_transfer_ownership_to_copy(task->data[i].data_out->original,
                                                        gpu_device->super.device_index,
                                                        flow->flow_flags);
+            task->data[i].data_out->data_transfer_status = PARSEC_DATA_STATUS_COMPLETE_TRANSFER;
 
             parsec_data_copy_t* source = gtask->sources[i];
             parsec_device_gpu_module_t *src_device =
@@ -2264,6 +2269,7 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
 
         assert( this_task->data[i].data_in == NULL || original == this_task->data[i].data_in->original );
 
+#if 0
         if( (gpu_task->task_type != PARSEC_GPU_TASK_TYPE_D2D_COMPLETE) && !(flow->flow_flags & PARSEC_FLOW_ACCESS_WRITE) ) {
             /* Do not propagate GPU copies to successors (temporary solution) */
             this_task->data[i].data_out = original->device_copies[0];
@@ -2275,6 +2281,8 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
                                      this_task->data[i].data_out, this_task->data[i].data_out->super.super.obj_reference_count,
                                      original);
         }
+#endif // 0
+
         parsec_atomic_lock(&original->lock);
         if( flow->flow_flags & PARSEC_FLOW_ACCESS_READ ) {
             int current_readers = parsec_atomic_fetch_sub_int32(&gpu_copy->readers, 1) - 1;
@@ -2287,7 +2295,7 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
                                      i, original, current_readers);
             }
             assert(current_readers >= 0);
-            if( (0 == current_readers) && !(flow->flow_flags & PARSEC_FLOW_ACCESS_WRITE) ) {
+            if( (0 == current_readers) && gpu_copy->coherency_state == PARSEC_DATA_COHERENCY_SHARED ) {
                  PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                                      "GPU[%d:%s]:\tMake read-only copy %p [ref_count %d] available on flow %s",
                                      gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->super.super.obj_reference_count, flow->name);
@@ -2436,15 +2444,20 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
         assert( PARSEC_DATA_COHERENCY_OWNED == gpu_copy->coherency_state );
 
         /* Don't mess with the host copy if it's not allocated */
+#if 0
+        // TODO: THIS IS INSANE! Why do we mess with the CPU copy if we haven't done a pushout?
         if ( NULL != cpu_copy->device_private ) {
             gpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
             cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
             cpu_copy->version = gpu_copy->version;
             PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
-                                "GPU[%d:%s]: CPU copy %p [ref_count %d] gets the same version %d as GPU copy %p [ref_count %d]",
+                                "GPU[%d:%s]: CPU copy %p [ref_count %d, ptr %p] gets the same version %d as GPU copy %p [ref_count %d]",
                                 gpu_device->super.device_index, gpu_device->super.name,
-                                cpu_copy, cpu_copy->super.super.obj_reference_count, cpu_copy->version, gpu_copy, gpu_copy->super.super.obj_reference_count);
-        } else {
+                                cpu_copy, cpu_copy->super.super.obj_reference_count, cpu_copy->device_private, cpu_copy->version,
+                                gpu_copy, gpu_copy->super.super.obj_reference_count);
+        } else
+#endif // 0
+        {
             PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
                                 "GPU[%d:%s]: CPU copy %p [ref_count %d] version not updated to %d of GPU copy %p [ref_count %d] because no host data allocated",
                                 gpu_device->super.device_index, gpu_device->super.name,
@@ -2476,6 +2489,9 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
                                  gpu_copy, gpu_copy->super.super.obj_reference_count, __func__);
             parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
             PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
+            gpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
+            cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
+            cpu_copy->version = gpu_copy->version;
             parsec_list_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
         } else {
             PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,

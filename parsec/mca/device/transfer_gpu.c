@@ -276,6 +276,7 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
             parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
             PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
             gpu_copy->readers++;
+            cpu_copy->version = gpu_copy->version;
             d2h_task->data[nb_cleaned].data_out = gpu_copy;
             gpu_copy->data_transfer_status = PARSEC_DATA_STATUS_UNDER_TRANSFER;  /* mark the copy as in transfer */
             parsec_atomic_unlock( &gpu_copy->original->lock );
