@@ -1769,6 +1769,8 @@ parsec_device_callback_complete_push(parsec_device_gpu_module_t   *gpu_device,
                                             cpu_copy, cpu_copy->super.super.obj_reference_count, cpu_copy->device_private);
                         cpu_copy->release_cb(cpu_copy, 0);
                         cpu_copy->device_private = NULL;
+                        cpu_copy->version = 0;
+                        cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_INVALID;
                     }
                 }
                 task->data[i].data_in->flags ^= PARSEC_DATA_FLAG_EVICTED;
@@ -2295,7 +2297,12 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
                                      i, original, current_readers);
             }
             assert(current_readers >= 0);
+            PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
+                                 "GPU[%d:%s]:\tread copy %p [ref_count %d] on flow %s has readers (%i)",
+                                 gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->super.super.obj_reference_count, flow->name, current_readers);
             if (flow->flow_flags == PARSEC_FLOW_ACCESS_READ) {
+                /* Do not propagate GPU copies to successors */
+                this_task->data[i].data_out = original->device_copies[0];
                 if( (0 == current_readers) && gpu_copy->coherency_state == PARSEC_DATA_COHERENCY_SHARED ) {
                     PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                                         "GPU[%d:%s]:\tMake read-only copy %p [ref_count %d] available on flow %s",
@@ -2317,9 +2324,6 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
                     continue;  /* done with this element, go for the next one */
                 }
             }
-            PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
-                                 "GPU[%d:%s]:\tread copy %p [ref_count %d] on flow %s has readers (%i)",
-                                 gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->super.super.obj_reference_count, flow->name, current_readers);
         }
         if( flow->flow_flags & PARSEC_FLOW_ACCESS_WRITE ) {
             assert( gpu_copy == parsec_data_get_copy(gpu_copy->original, gpu_device->super.device_index) );
