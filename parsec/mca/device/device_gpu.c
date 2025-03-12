@@ -2295,16 +2295,27 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
                                      i, original, current_readers);
             }
             assert(current_readers >= 0);
-            if( (0 == current_readers) && gpu_copy->coherency_state == PARSEC_DATA_COHERENCY_SHARED ) {
-                 PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
-                                     "GPU[%d:%s]:\tMake read-only copy %p [ref_count %d] available on flow %s",
-                                     gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->super.super.obj_reference_count, flow->name);
-                parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
-                PARSEC_LIST_ITEM_SINGLETON(gpu_copy); /* TODO: singleton instead? */
-                parsec_list_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
-                update_data_epoch = 1;
-                parsec_atomic_unlock(&original->lock);
-                continue;  /* done with this element, go for the next one */
+            if (flow->flow_flags == PARSEC_FLOW_ACCESS_READ) {
+                if( (0 == current_readers) && gpu_copy->coherency_state == PARSEC_DATA_COHERENCY_SHARED ) {
+                    PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
+                                        "GPU[%d:%s]:\tMake read-only copy %p [ref_count %d] available on flow %s",
+                                        gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->super.super.obj_reference_count, flow->name);
+                    parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
+                    PARSEC_LIST_ITEM_SINGLETON(gpu_copy); /* TODO: singleton instead? */
+                    parsec_list_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
+                    update_data_epoch = 1;
+                    parsec_atomic_unlock(&original->lock);
+                    continue;  /* done with this element, go for the next one */
+                } else if (gpu_copy->coherency_state != PARSEC_DATA_COHERENCY_SHARED) {
+                    PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
+                                        "GPU[%d:%s]:\tMake read-only copy %p [ref_count %d] available to owned LRU",
+                                        gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->super.super.obj_reference_count);
+                    parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
+                    PARSEC_LIST_ITEM_SINGLETON(gpu_copy); /* TODO: singleton instead? */
+                    parsec_list_push_back(&gpu_device->gpu_mem_owned_lru, (parsec_list_item_t*)gpu_copy);
+                    parsec_atomic_unlock(&original->lock);
+                    continue;  /* done with this element, go for the next one */
+                }
             }
             PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                                  "GPU[%d:%s]:\tread copy %p [ref_count %d] on flow %s has readers (%i)",
@@ -2497,6 +2508,8 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
             PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                                  "GPU copy %p [ref_count %d] moved to the owned LRU in %s",
                                  gpu_copy, gpu_copy->super.super.obj_reference_count, __func__);
+            parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
+            PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
             parsec_list_push_back(&gpu_device->gpu_mem_owned_lru, (parsec_list_item_t*)gpu_copy);
         }
     }
