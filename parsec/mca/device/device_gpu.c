@@ -1775,6 +1775,7 @@ parsec_device_callback_complete_push(parsec_device_gpu_module_t   *gpu_device,
                         cpu_copy->device_private = NULL;
                         cpu_copy->version = 0;
                         cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_INVALID;
+                        gpu_copy->coherency_state = PARSEC_DATA_COHERENCY_EXCLUSIVE;
                     }
                 }
                 task->data[i].data_in->flags ^= PARSEC_DATA_FLAG_EVICTED;
