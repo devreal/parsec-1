@@ -1391,6 +1391,8 @@ parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
 
     transfer_from = parsec_data_start_transfer_ownership_to_copy(original, gpu_device->super.device_index, (uint8_t)type);
 
+#if 0
+    // JS: this case should be handled by transfer-ownership because the host copy should be invalid if its version is 0
     /* If data is from NEW (it doesn't have a source_repo_entry and is not a direct data collection reference),
      * and nobody has touched it yet, then we don't need to pull it in, we have created it already, that's enough. */
     /*
@@ -1400,6 +1402,7 @@ parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
         (NULL == task_data->data_in->original->dc) &&
         (0 == task_data->data_in->version) )
         transfer_from = -1;
+#endif // 0
 
     /* Update the transferred required_data_in size */
     gpu_device->super.required_data_in += original->nb_elts;
