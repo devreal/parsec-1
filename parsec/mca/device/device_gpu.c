@@ -1469,7 +1469,7 @@ parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
             assert( PARSEC_DEV_IS_GPU(target->super.type) );
 
             candidate = original->device_copies[t];
-            if( (NULL == candidate) || (candidate->version != task_data->data_in->version) ) {
+            if( (NULL == candidate) || (candidate->version < task_data->data_in->version) ) {
                 PARSEC_DEBUG_VERBOSE(30, parsec_gpu_output_stream,
                                      "GPU[%d:%s]:\tcopy %p:%d cannot be a candidate VERSION MISMATCH with %p:%d",
                                      gpu_device->super.device_index, gpu_device->super.name,
@@ -1497,7 +1497,7 @@ parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
                 /* Coordination protocol with the owner of the candidate. If the owner had repurposed the copy, by the
                  * time we succesfully increase the readers, the device copy will be associated with a different data.
                  */
-                if( (candidate->original == original) && (candidate->version == task_data->data_in->version) ) {
+                if( (candidate->original == original) && (candidate->version >= task_data->data_in->version) ) {
                     PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
                                          "GPU[%d:%s]:\tData copy %p [ref_count %d] on PaRSEC device %s is the best candidate to do Device to Device copy, increasing its readers to %d",
                                          gpu_device->super.device_index, gpu_device->super.name, candidate, candidate->super.super.obj_reference_count, target->super.name, candidate->readers+1);
