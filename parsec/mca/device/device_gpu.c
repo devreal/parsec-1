@@ -933,8 +933,9 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
         if(PARSEC_FLOW_ACCESS_NONE == (PARSEC_FLOW_ACCESS_MASK & flow->flow_flags)) continue;
 
         PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
-                             "GPU[%d:%s]:%s: Investigating flow %s:%d",
-                             gpu_device->super.device_index, gpu_device->super.name, task_name, flow->name, i);
+                             "GPU[%d:%s]:%s: Investigating flow %s:%d flags %d",
+                             gpu_device->super.device_index, gpu_device->super.name, task_name,
+                             flow->name, i, flow->flow_flags);
         temp_loc[i] = NULL;
         if (this_task->data[i].data_in == NULL)
             continue;
