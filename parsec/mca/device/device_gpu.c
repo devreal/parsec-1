@@ -1836,7 +1836,7 @@ parsec_device_callback_complete_push(parsec_device_gpu_module_t   *gpu_device,
                                          source->super.super.obj_reference_count, src_device->super.name,
                                          readers);
                     assert(readers >= 0);
-                    if(0 == readers) {
+                    if(0 == readers && 0 != (source->flags & PARSEC_DATA_FLAG_PARSEC_OWNED)) {
                         PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                                              "GPU[%d:%s]:\tMake read-only copy %p [ref_count %d] available",
                                              gpu_device->super.device_index, gpu_device->super.name, source,
