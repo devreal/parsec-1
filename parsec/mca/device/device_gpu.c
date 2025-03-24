@@ -798,10 +798,24 @@ static void parsec_device_memory_release_list(parsec_device_gpu_module_t* gpu_de
                                               parsec_list_t* list)
 {
     parsec_list_item_t* item;
+    int num_discarded = 0;
 
     while(NULL != (item = parsec_list_pop_front(list)) ) {
         parsec_gpu_data_copy_t* gpu_copy = (parsec_gpu_data_copy_t*)item;
         parsec_data_t* original = gpu_copy->original;
+
+        if (NULL != original) {
+            parsec_data_copy_t *cpu_copy = original->device_copies[0];
+            PARSEC_LIST_ITEM_SINGLETON(item);
+
+            if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) {
+                num_discarded++;
+                PARSEC_DEBUG_VERBOSE(30, parsec_gpu_output_stream,
+                                    "Releasing discarded GPU copy %p from data %p", gpu_copy, original);
+                parsec_device_release_gpu_copy(gpu_device, gpu_copy);
+                continue;
+            }
+        }
 
         PARSEC_DEBUG_VERBOSE(35, parsec_gpu_output_stream,
                             "GPU[%d:%s] Release GPU copy %p (device_ptr %p) [ref_count %d: must be 1], attached to %p, in map %p",
@@ -828,6 +842,7 @@ static void parsec_device_memory_release_list(parsec_device_gpu_module_t* gpu_de
         parsec_device_release_gpu_copy(gpu_device, gpu_copy);
 #endif
     }
+    parsec_atomic_fetch_sub_int64(&gpu_device->super.nb_discarded, num_discarded);
 }
 
 /**
@@ -838,13 +853,10 @@ parsec_device_flush_lru( parsec_device_module_t *device )
 {
     size_t in_use;
     parsec_device_gpu_module_t *gpu_device = (parsec_device_gpu_module_t*)device;
-    /* Remove discarded data copies */
-    parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_lru);
-    parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_owned_lru);
-    assert(gpu_device->super.nb_discarded == 0);
     /* Free all remaining memory on GPU */
     parsec_device_memory_release_list(gpu_device, &gpu_device->gpu_mem_lru);
     parsec_device_memory_release_list(gpu_device, &gpu_device->gpu_mem_owned_lru);
+    assert(gpu_device->super.nb_discarded == 0);
     parsec_device_free_workspace(gpu_device);
 #if !defined(PARSEC_GPU_ALLOC_PER_TILE) && !defined(_NDEBUG)
     if( (in_use = zone_in_use(gpu_device->memory)) != 0 ) {
