@@ -2823,6 +2823,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     parsec_device_kernel_epilog( gpu_device, gpu_task );
     // ship the task to other threads to complete its execution
     gpu_task->ec->status = PARSEC_TASK_STATUS_COMPLETE;
+    PARSEC_LIST_ITEM_SINGLETON(gpu_task->ec);
     __parsec_schedule(es, gpu_task->ec, 1);
     gpu_device->super.executed_tasks++;
  remove_gpu_task:
