@@ -67,8 +67,7 @@ parsec_device_check_space_needed(parsec_device_gpu_module_t *gpu_device,
         if( NULL != PARSEC_DATA_GET_COPY(original, gpu_device->super.device_index) ) {
             continue;
         }
-        if(flow->flow_flags & PARSEC_FLOW_ACCESS_READ)
-            space_needed++;
+        space_needed++;
     }
     return space_needed;
 }
@@ -1958,9 +1957,16 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
      * Kernels will be handled in the order in which they arrive. */
     if( NULL != task ) {
         if (task->task_type != PARSEC_GPU_TASK_TYPE_KERNEL) {
-            parsec_list_push_front(stream->fifo_pending, (parsec_list_item_t*)task);
+            parsec_list_nolock_push_front(stream->fifo_pending, (parsec_list_item_t*)task);
+        } else if (stream == gpu_device->exec_stream[0] && 0 == parsec_device_check_space_needed(gpu_device, task)) {
+            /**
+             * Push this task to the front if it has all inputs ready.
+             * The sorting is only relevant for stream 0 where we handle inputs.
+             * For other streams, we just push the task to the end of the queue.
+             */
+            parsec_list_nolock_push_front(stream->fifo_pending, (parsec_list_item_t*)task);
         } else {
-            parsec_list_push_back(stream->fifo_pending, (parsec_list_item_t*)task);
+            parsec_list_nolock_push_back(stream->fifo_pending, (parsec_list_item_t*)task);
         }
         task = NULL;
     }
@@ -2008,7 +2014,7 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
 
  grab_a_task:
     if( NULL == stream->tasks[stream->start] ) {  /* there is room on the stream */
-        task = (parsec_gpu_task_t*)parsec_list_pop_front(stream->fifo_pending);  /* get the best task */
+        task = (parsec_gpu_task_t*)parsec_list_nolock_pop_front(stream->fifo_pending);  /* get the best task */
     }
     if( NULL == task ) {  /* No tasks, we're done */
         return PARSEC_HOOK_RETURN_DONE;
@@ -2026,7 +2032,7 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
                  * the resubmission of this task as much as possible, but without loosing track of it
                  * (aka. returning it to the upper level).
                  */
-                parsec_list_push_back(stream->fifo_pending, (parsec_list_item_t*)task);
+                parsec_list_nolock_push_back(stream->fifo_pending, (parsec_list_item_t*)task);
             } else {
                 /* Something else is going on with this task, remove it from the stream queues
                  * and return it to the upper level for final decision on its fate.
