@@ -21,6 +21,7 @@
 #include <threads.h>
 
 #define PARSEC_DEVICE_DATA_COPY_ATOMIC_SENTINEL 1024
+#define PARSEC_DEVICE_CLEAR_EVERY 128
 
 #if defined(PARSEC_PROF_TRACE)
 static int parsec_gpu_movein_key_start;
@@ -2636,6 +2637,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     int rc, exec_stream = 0;
     parsec_gpu_task_t *progress_task, *out_task_submit = NULL, *out_task_pop = NULL;
     parsec_gpu_task_t *gpu_task = (parsec_gpu_task_t*)_gpu_task;
+    int clear_device_counter = PARSEC_DEVICE_CLEAR_EVERY;
 #if defined(PARSEC_DEBUG_NOISIER)
     char tmp[MAX_TASK_STRLEN];
 #endif
@@ -2771,6 +2773,11 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     if( NULL != gpu_task ) {  /* This task has completed its execution */
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,  "GPU[%d:%s]:\tRetrieve data (if any) for %s", gpu_device->super.device_index, gpu_device->super.name,
                             parsec_task_snprintf(tmp, MAX_TASK_STRLEN, gpu_task->ec));
+    } else if (clear_device_counter-- == 0) {
+        /* every so often if we are idle release discarded data to clean up the host-side copies */
+        parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_owned_lru);
+        parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_lru);
+        clear_device_counter = PARSEC_DEVICE_CLEAR_EVERY;
     }
     /* Task is ready to move the data back to main memory */
     rc = parsec_device_progress_stream( gpu_device,
