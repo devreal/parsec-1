@@ -607,15 +607,19 @@ parsec_data_discard( parsec_data_t *data )
     }
 
     /**
-     * Tell the devices that they have discarded data.
+     * Tell the devices that they have discarded data and release the memory to the zone allocator.
      */
     for (uint32_t i = 1; i < parsec_nb_devices; i++) {
-        if (parsec_mca_device_is_gpu(i)) {
-            parsec_data_copy_t *device_copy = data->device_copies[i];
-            if (NULL != device_copy) {
-                parsec_device_module_t* device = parsec_mca_device_get(i);
+        parsec_data_copy_t *device_copy = data->device_copies[i];
+        if (NULL != device_copy) {
+            if (parsec_mca_device_is_gpu(i)) {
+                parsec_device_gpu_module_t *gpu_device = (parsec_device_gpu_module_t*)parsec_mca_device_get(i);
                 if (NULL != device) {
-                    parsec_atomic_fetch_inc_int64(&device->nb_discarded);
+                    parsec_atomic_fetch_inc_int64(&gpu_device->super.nb_discarded);
+                    if (device_copy->device_private != NULL && device_copy->flags & PARSEC_DATA_FLAG_OWNED) {
+                        zone_free(gpu_device->memory, device_copy->device_private);
+                        device_copy->device_private = NULL;
+                    }
                 }
             }
         }
