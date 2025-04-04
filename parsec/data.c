@@ -15,6 +15,8 @@
 #include "parsec/sys/atomic.h"
 #include "parsec/remote_dep.h"
 #include "parsec/parsec_internal.h"
+#include "parsec/mca/device/device_gpu.h"
+#include "parsec/utils/zone_malloc.h"
 
 static parsec_lifo_t parsec_data_lifo;
 static parsec_lifo_t parsec_data_copies_lifo;
@@ -614,9 +616,9 @@ parsec_data_discard( parsec_data_t *data )
         if (NULL != device_copy) {
             if (parsec_mca_device_is_gpu(i)) {
                 parsec_device_gpu_module_t *gpu_device = (parsec_device_gpu_module_t*)parsec_mca_device_get(i);
-                if (NULL != device) {
+                if (NULL != gpu_device) {
                     parsec_atomic_fetch_inc_int64(&gpu_device->super.nb_discarded);
-                    if (device_copy->device_private != NULL && device_copy->flags & PARSEC_DATA_FLAG_OWNED) {
+                    if (device_copy->device_private != NULL && device_copy->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) {
                         zone_free(gpu_device->memory, device_copy->device_private);
                         device_copy->device_private = NULL;
                     }
