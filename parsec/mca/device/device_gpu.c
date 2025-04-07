@@ -426,9 +426,18 @@ void parsec_device_release_gpu_copy(parsec_device_gpu_module_t* gpu_device, pars
     if (0 != (gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED)) {
         //assert( 0 != (gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) );
         //assert(gpu_elem->device_private != NULL);
+        parsec_data_t* data = gpu_elem->original;
+        if (data != NULL) {
+            /* have to take the lock to protect against double frees */
+            parsec_atomic_lock(&data->lock);
+        }
         if (gpu_elem->device_private != NULL) {
             zone_free( gpu_device->memory, (void*)(gpu_elem->device_private) );
             gpu_elem->device_private = NULL;
+        }
+        if (data != NULL) {
+            /* release the lock */
+            parsec_atomic_unlock(&data->lock);
         }
     }
     PARSEC_OBJ_RELEASE(gpu_elem);
