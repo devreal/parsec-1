@@ -773,37 +773,30 @@ static int parsec_device_memory_release_discarded(parsec_device_gpu_module_t* gp
                                                   parsec_list_t* list)
 {
     parsec_list_item_t* item;
-    parsec_list_item_t* ring = NULL;
     int count = 0;
 
     if (gpu_device->super.nb_discarded == 0) {
         return 0;
     }
 
-    while (NULL != (item = parsec_list_nolock_pop_front(list))) {
+    for (item = PARSEC_LIST_ITERATOR_BEGIN(list);
+         item != PARSEC_LIST_ITERATOR_END(list);
+         item = PARSEC_LIST_ITEM_NEXT(item)) {
         parsec_gpu_data_copy_t* gpu_copy = (parsec_gpu_data_copy_t*)item;
         parsec_data_t* original = gpu_copy->original;
         if (NULL != original) {
             parsec_data_copy_t *cpu_copy = original->device_copies[0];
             PARSEC_LIST_ITEM_SINGLETON(item);
 
-            if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) {
+            if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED && cpu_copy->readers == 0) {
                 count++;
-                parsec_device_release_gpu_copy(gpu_device, gpu_copy);
                 PARSEC_DEBUG_VERBOSE(30, parsec_gpu_output_stream,
                                     "Releasing discarded GPU copy %p from data %p", gpu_copy, original);
+                parsec_device_release_gpu_copy(gpu_device, gpu_copy);
+                parsec_list_nolock_remove(list, item);
                 continue;
             }
         }
-        if (ring == NULL) {
-            ring = item;
-        } else {
-            parsec_list_item_ring_push(ring, item);
-        }
-    }
-    /* put the ring back into the list */
-    if (NULL != ring) {
-        parsec_list_chain_front(list, ring);
     }
     parsec_atomic_fetch_sub_int64(&gpu_device->super.nb_discarded, count);
     return count;
