@@ -434,6 +434,7 @@ void parsec_device_release_gpu_copy(parsec_device_gpu_module_t* gpu_device, pars
         if (gpu_elem->device_private != NULL) {
             zone_free( gpu_device->memory, (void*)(gpu_elem->device_private) );
             gpu_elem->device_private = NULL;
+            gpu_device->data_avail_epoch++;
         }
         if (data != NULL) {
             /* release the lock */

@@ -621,6 +621,7 @@ parsec_data_discard( parsec_data_t *data )
                     if (device_copy->device_private != NULL && device_copy->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) {
                         zone_free(gpu_device->memory, device_copy->device_private);
                         device_copy->device_private = NULL;
+                        gpu_device->data_avail_epoch++;
                     }
                 }
             }
