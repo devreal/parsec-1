@@ -327,7 +327,7 @@ void parsec_data_end_transfer_ownership_to_copy(parsec_data_t* data,
         copy->coherency_state = PARSEC_DATA_COHERENCY_OWNED;
 
         /* mark all but the current device as invalid */
-        for( int i = 0; i < parsec_nb_devices; i++ ) {
+        for( uint32_t i = 0; i < parsec_nb_devices; i++ ) {
             if (device == i || NULL == data->device_copies[i]) continue;
             data->device_copies[i]->coherency_state = PARSEC_DATA_COHERENCY_INVALID;
         }
@@ -618,7 +618,10 @@ parsec_data_discard( parsec_data_t *data )
                 parsec_device_gpu_module_t *gpu_device = (parsec_device_gpu_module_t*)parsec_mca_device_get(i);
                 if (NULL != gpu_device) {
                     parsec_atomic_fetch_inc_int64(&gpu_device->super.nb_discarded);
-                    if (device_copy->device_private != NULL && device_copy->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) {
+                    if (device_copy->device_private != NULL &&
+                        device_copy->flags & PARSEC_DATA_FLAG_PARSEC_OWNED &&
+                        device_copy->readers == 0)
+                    {
                         zone_free(gpu_device->memory, device_copy->device_private);
                         device_copy->device_private = NULL;
                         gpu_device->data_avail_epoch++;
