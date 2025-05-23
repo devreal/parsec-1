@@ -492,7 +492,7 @@ mpi_funnelled_internal_put_am_callback(parsec_comm_engine_t *ce,
     pthread_mutex_lock(&array_of_requests_mtx);
     assert(mpi_funnelled_last_active_req >= mpi_funnelled_static_req_idx);
     int post_in_static_array = mpi_funnelled_last_active_req < current_size_of_total_reqs;
-    if (MAX_NUM_RECV_REQ_IN_ARRAY >= mpi_funnelled_num_recv_req_in_arr) {
+    if (MAX_NUM_RECV_REQ_IN_ARRAY <= mpi_funnelled_num_recv_req_in_arr) {
         post_in_static_array = 0;
     } else if (post_in_static_array) {
         mpi_funnelled_num_recv_req_in_arr++;
@@ -1234,7 +1234,7 @@ mpi_no_thread_get(parsec_comm_engine_t *ce,
     assert(mpi_funnelled_last_active_req >= mpi_funnelled_static_req_idx);
 
     int post_in_static_array = mpi_funnelled_last_active_req < current_size_of_total_reqs;
-    if (MAX_NUM_RECV_REQ_IN_ARRAY >= mpi_funnelled_num_recv_req_in_arr) {
+    if (MAX_NUM_RECV_REQ_IN_ARRAY <= mpi_funnelled_num_recv_req_in_arr) {
         post_in_static_array = 0;
     } else if (post_in_static_array) {
         mpi_funnelled_num_recv_req_in_arr++;
