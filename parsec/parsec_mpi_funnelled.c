@@ -347,6 +347,7 @@ static void* worker_main(void* arg) {
             /* process the items we popped */
             for (int i = 0; i < check_count; ++i) {
                 mpi_funnelled_dynamic_req_t *item = items[i];
+                items[i] = NULL;
                 mpi_funnelled_callback_t *cb = &item->cb;
                 /* we don't restart the request here, it was done after the test */
                 mpi_no_thread_serve_cb(item->ce, cb, item->tag, item->source, item->length,
@@ -1460,6 +1461,7 @@ mpi_no_thread_push_posted_req(parsec_comm_engine_t *ce)
             return 0;
         }
 
+        int pos = mpi_funnelled_last_active_req++;
         if(item->post_isend) {
             pthread_mutex_unlock(&array_of_requests_mtx);
             int tag, count, remote;
@@ -1491,31 +1493,31 @@ mpi_no_thread_push_posted_req(parsec_comm_engine_t *ce)
             pthread_mutex_lock(&array_of_requests_mtx);
         }
 
-        array_of_requests[mpi_funnelled_last_active_req] = item->request;
+        array_of_requests[pos] = item->request;
         item->request = MPI_REQUEST_NULL;
-
-        array_of_callbacks[mpi_funnelled_last_active_req].storage1 = item->cb.storage1;
-        array_of_callbacks[mpi_funnelled_last_active_req].storage2 = item->cb.storage2;
-        array_of_callbacks[mpi_funnelled_last_active_req].cb_data = item->cb.cb_data;
-        array_of_callbacks[mpi_funnelled_last_active_req].dynamic_req = item->cb.dynamic_req;
-        array_of_callbacks[mpi_funnelled_last_active_req].type = item->cb.type;
-        array_of_callbacks[mpi_funnelled_last_active_req].tag_reg = item->cb.tag_reg;
-        array_of_callbacks[mpi_funnelled_last_active_req].is_dynamic_recv = item->cb.is_dynamic_recv;
-        array_of_callbacks[mpi_funnelled_last_active_req].free_cb_data = item->cb.free_cb_data;
+        array_of_callbacks[pos] = item->cb;
+#if 0
+        array_of_callbacks[pos].storage1        = item->cb.storage1;
+        array_of_callbacks[pos].storage2        = item->cb.storage2;
+        array_of_callbacks[pos].cb_data         = item->cb.cb_data;
+        array_of_callbacks[pos].dynamic_req     = item->cb.dynamic_req;
+        array_of_callbacks[pos].type            = item->cb.type;
+        array_of_callbacks[pos].tag_reg         = item->cb.tag_reg;
+        array_of_callbacks[pos].is_dynamic_recv = item->cb.is_dynamic_recv;
+        array_of_callbacks[pos].free_cb_data    = item->cb.free_cb_data;
 
         if(item->cb.type == MPI_FUNNELLED_TYPE_ONESIDED) {
-            array_of_callbacks[mpi_funnelled_last_active_req].onesided = item->cb.onesided;
+            array_of_callbacks[pos].onesided = item->cb.onesided;
         } else if (item->cb.type == MPI_FUNNELLED_TYPE_ONESIDED_MIMIC_AM) {
-            array_of_callbacks[mpi_funnelled_last_active_req].onesided = item->cb.onesided;
-            array_of_callbacks[mpi_funnelled_last_active_req].cb_type.onesided_mimic_am = item->cb.cb_type.onesided_mimic_am;
+            array_of_callbacks[pos].onesided = item->cb.onesided;
+            array_of_callbacks[pos].cb_type.onesided_mimic_am = item->cb.cb_type.onesided_mimic_am;
         } else if (item->cb.type == MPI_FUNNELLED_TYPE_SENDAM) {
             /* nothing to do */
         } else {
             /* No other types of callbacks should be postponed */
             assert(0);
         }
-
-        mpi_funnelled_last_active_req++;
+#endif // 0
 
         /* only return the item if we don't need to keep it */
         if (NULL == item->cb.dynamic_req) {
