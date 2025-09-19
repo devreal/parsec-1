@@ -411,14 +411,15 @@ int parsec_data_start_transfer_ownership_to_copy(parsec_data_t* data,
         for( i = 0; i < parsec_nb_devices; i++ ) {
             if( device == i || NULL == data->device_copies[i] ) continue;
             if( PARSEC_DATA_COHERENCY_INVALID == data->device_copies[i]->coherency_state ) continue;
-            if( PARSEC_DATA_COHERENCY_OWNED == copy->coherency_state
+            if( PARSEC_DATA_COHERENCY_OWNED == data->device_copies[i]->coherency_state
              && !(PARSEC_FLOW_ACCESS_WRITE & access_mode) ) {
                  if( data->device_copies[i]->version < copy->version ) {
                      data->device_copies[i]->coherency_state = PARSEC_DATA_COHERENCY_INVALID;
                  }
                  data->owner_device = -1;
             }
-            if( PARSEC_DATA_COHERENCY_EXCLUSIVE == data->device_copies[i]->coherency_state ) {
+            if( PARSEC_DATA_COHERENCY_EXCLUSIVE == data->device_copies[i]->coherency_state ||
+                PARSEC_DATA_COHERENCY_OWNED     == data->device_copies[i]->coherency_state ) {
                 assert(data->device_copies[i]->data_transfer_status != PARSEC_DATA_STATUS_UNDER_TRANSFER);
                 data->device_copies[i]->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
             }
