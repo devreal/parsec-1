@@ -319,7 +319,9 @@ void parsec_data_end_transfer_ownership_to_copy(parsec_data_t* data,
     assert( NULL != copy );
     //assert(copy->data_transfer_status != PARSEC_DATA_STATUS_UNDER_TRANSFER /* this must be set by the caller */);
 
-    if( PARSEC_FLOW_ACCESS_READ & access_mode && copy->data_transfer_status == PARSEC_DATA_STATUS_UNDER_TRANSFER ) {
+    if( (PARSEC_FLOW_ACCESS_READ & access_mode) &&
+        (0 == (PARSEC_FLOW_ACCESS_WRITE & access_mode)) &&
+        copy->data_transfer_status == PARSEC_DATA_STATUS_UNDER_TRANSFER ) {
         /* if a copy was a previously EXCLUSIVE or OWNED it is now shared */
         for( uint32_t i = 0; i < parsec_nb_devices; i++ ) {
             if (NULL == data->device_copies[i]) continue;
