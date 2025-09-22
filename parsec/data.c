@@ -320,6 +320,13 @@ void parsec_data_end_transfer_ownership_to_copy(parsec_data_t* data,
     //assert(copy->data_transfer_status != PARSEC_DATA_STATUS_UNDER_TRANSFER /* this must be set by the caller */);
 
     if( PARSEC_FLOW_ACCESS_READ & access_mode && copy->data_transfer_status == PARSEC_DATA_STATUS_UNDER_TRANSFER ) {
+        /* if a copy was a previously EXCLUSIVE or OWNED it is now shared */
+        for( uint32_t i = 0; i < parsec_nb_devices; i++ ) {
+            if (NULL == data->device_copies[i]) continue;
+            if (data->device_copies[i]->coherency_state == PARSEC_DATA_COHERENCY_OWNED) {
+                data->device_copies[i]->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
+            }
+        }
         copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
     }
 
@@ -401,7 +408,8 @@ int parsec_data_start_transfer_ownership_to_copy(parsec_data_t* data,
             if( device == i || NULL == data->device_copies[i] ) continue;
             assert( PARSEC_DATA_COHERENCY_INVALID == data->device_copies[i]->coherency_state
                  || PARSEC_DATA_COHERENCY_SHARED == data->device_copies[i]->coherency_state );
-            assert( copy->version >= data->device_copies[i]->version );
+            /* check for UINT_MAX because we have a race condition with parsec_device_data_reserve_space */
+            assert( (copy->version >= data->device_copies[i]->version) || data->device_copies[i]->version == UINT_MAX );
         }
 #endif  /* defined(PARSEC_DEBUG_PARANOID) */
         break;
@@ -418,8 +426,7 @@ int parsec_data_start_transfer_ownership_to_copy(parsec_data_t* data,
                  }
                  data->owner_device = -1;
             }
-            if( PARSEC_DATA_COHERENCY_EXCLUSIVE == data->device_copies[i]->coherency_state ||
-                PARSEC_DATA_COHERENCY_OWNED     == data->device_copies[i]->coherency_state ) {
+            if( PARSEC_DATA_COHERENCY_EXCLUSIVE == data->device_copies[i]->coherency_state ) {
                 assert(data->device_copies[i]->data_transfer_status != PARSEC_DATA_STATUS_UNDER_TRANSFER);
                 data->device_copies[i]->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
             }
