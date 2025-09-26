@@ -427,7 +427,7 @@ int parsec_data_start_transfer_ownership_to_copy(parsec_data_t* data,
             if( PARSEC_DATA_COHERENCY_INVALID == data->device_copies[i]->coherency_state ) continue;
             if( PARSEC_DATA_COHERENCY_OWNED == data->device_copies[i]->coherency_state
              && !(PARSEC_FLOW_ACCESS_WRITE & access_mode) ) {
-                 if( data->device_copies[i]->version < copy->version ) {
+                 if( copy->version != UINT_MAX && data->device_copies[i]->version < copy->version ) {
                      data->device_copies[i]->coherency_state = PARSEC_DATA_COHERENCY_INVALID;
                  }
             }
