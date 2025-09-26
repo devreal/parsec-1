@@ -18,6 +18,8 @@
 #include "parsec/mca/device/device_gpu.h"
 #include "parsec/utils/zone_malloc.h"
 
+#include <limits.h>
+
 static parsec_lifo_t parsec_data_lifo;
 static parsec_lifo_t parsec_data_copies_lifo;
 
