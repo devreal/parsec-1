@@ -30,11 +30,12 @@ typedef struct segment {
 } segment_t;
 
 typedef struct zone_malloc_s {
-    char      *base;                 /* Base pointer              */
-    segment_t *segments;             /* Array of segments */
-    size_t     unit_size;            /* Basic Unit                */
-    int        max_segment;          /* Maximum number of segment */
+    char      *base;                 /* Base pointer               */
+    segment_t *segments;             /* Array of segments          */
+    size_t     unit_size;            /* Basic Unit                 */
+    int        max_segment;          /* Maximum number of segments */
     int        next_tid;             /* Next TID to look at for a malloc */
+    size_t     in_use;               /* Number of segments in use  */
     parsec_atomic_lock_t lock;
     parsec_rbtree_t rbtree;          /* RB tree tracking chunks of free segments */
     parsec_lifo_t rbtree_free_list;
@@ -69,6 +70,13 @@ void zone_free(zone_malloc_t *gdata, void *add);
  * Computes how much memory is in use
  */
 size_t zone_in_use(zone_malloc_t *gdata);
+
+/*
+ * Computes the watermark of the memory zone, i..e,
+ * the ratio of used memory over total memory.
+ * Returns a value between 0 and 1.
+ */
+float zone_watermark(zone_malloc_t *gdata);
 
 /**
  * Prints information on the amount of available blocks

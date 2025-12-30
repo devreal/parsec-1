@@ -72,6 +72,7 @@ zone_malloc_t* zone_malloc_init(void* base_ptr, int _max_segment, size_t _unit_s
     gdata->unit_size    = _unit_size;
     gdata->max_segment  = _max_segment;
     gdata->next_tid     = 0;
+    gdata->in_use       = 0;
     gdata->segments     = (segment_t *)malloc(sizeof(segment_t) * _max_segment);
     parsec_atomic_lock_init(&gdata->lock);
     parsec_rbtree_init(&gdata->rbtree, offsetof(zone_malloc_chunk_list_t, nb_units));
@@ -170,6 +171,8 @@ void *zone_malloc(zone_malloc_t *gdata, size_t size)
         /* reduce size of current segment */
         current_segment->nb_units = nb_units;
     }
+    /* update in_use tracking */
+    gdata->in_use += nb_units;
     /* found segment of right size, done */
     parsec_atomic_unlock(&gdata->lock);
     return (void*)(gdata->base + (current_tid * gdata->unit_size));
@@ -214,6 +217,10 @@ void zone_free(zone_malloc_t *gdata, void *add)
         parsec_atomic_unlock(&gdata->lock);
         return;
     }
+
+    /* update in_use tracking */
+    gdata->in_use -= current_segment->nb_units;
+    assert(gdata->in_use >= 0);
 
     /* check if we can merge segments */
     current_segment->status = SEGMENT_EMPTY;
@@ -262,6 +269,7 @@ void zone_free(zone_malloc_t *gdata, void *add)
 
 size_t zone_in_use(zone_malloc_t *gdata)
 {
+#if 0
     size_t ret = 0;
     segment_t *current_segment;
     int current_tid;
@@ -275,7 +283,13 @@ size_t zone_in_use(zone_malloc_t *gdata)
         }
     }
     parsec_atomic_unlock(&gdata->lock);
-    return ret;
+#endif // 0
+    return gdata->in_use * gdata->unit_size;
+}
+
+float zone_watermark(zone_malloc_t *gdata)
+{
+    return  ((float)gdata->in_use) / (float)(gdata->max_segment);
 }
 
 typedef struct zone_malloc_rbtree_debug_t {

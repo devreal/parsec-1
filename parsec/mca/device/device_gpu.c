@@ -43,6 +43,10 @@ int parsec_gpu_verbosity;
 
 static thread_local int active_w2r_tasks = 0;
 
+/* High watermark after which we start evicting data in an attempt
+ * to keep memory available. */
+static const float parsec_device_gpu_mem_high_watermark = 0.95f;
+
 static inline int
 parsec_device_check_space_needed(parsec_device_gpu_module_t *gpu_device,
                                  parsec_gpu_task_t *gpu_task)
@@ -2727,13 +2731,16 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
             gpu_task = NULL;
             goto check_in_deps;
         }
+    }
 
-        /* TODO: check this */
-        /* If we can extract data go for it, otherwise try to drain the pending tasks */
-        if (active_w2r_tasks == 0) {
-            gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
-            if( NULL != gpu_task ) {
-                active_w2r_tasks++;
+    /* If we can extract data go for it, otherwise try to drain the pending tasks.
+     * Even we pushed the task correctly, we still may want to discard data from the device
+     * in order to keep memory available. */
+    if (active_w2r_tasks == 0 && (rc < 0 || zone_watermark(gpu_device->memory) > parsec_device_gpu_mem_high_watermark)) {
+        gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
+        if( NULL != gpu_task ) {
+            active_w2r_tasks++;
+            if (rc < 0) {
                 goto get_data_out_of_device;
             }
         }
