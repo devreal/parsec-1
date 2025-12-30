@@ -476,8 +476,8 @@ static int parsec_termdet_fourcounter_taskpool_addto_nb_tasks(parsec_taskpool_t 
     assert( tp->tdm.module == &parsec_termdet_fourcounter_module.module );
     if(v == 0)
         return tp->nb_tasks;
-    PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-4C:\tNB_TASKS %d -> %d", tp->nb_tasks, tp->nb_tasks + v);
     int tmp = parsec_atomic_fetch_add_int32(&tp->nb_tasks, v);
+    PARSEC_DEBUG_VERBOSE(10, parsec_debug_output, "TERMDET-4C:\tNB_TASKS %d -> %d", tmp-v, tmp);
     assert( ((parsec_termdet_fourcounter_monitor_t *)tp->tdm.monitor)->state != PARSEC_TERMDET_FOURCOUNTER_TERMINATED );
     ret = tmp + v;
     if (tmp == 0 || ret == 0) {
