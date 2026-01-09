@@ -2708,6 +2708,21 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                              gpu_device->super.device_index, gpu_device->super.name,
                              parsec_device_describe_gpu_task(tmp, MAX_TASK_STRLEN, gpu_task));
     }
+    /* See if we need to push out data: either we failed to allocate earlier or we hit the high watermark */
+    if ((rc < 0 || zone_watermark(gpu_device->memory) > parsec_device_gpu_mem_high_watermark)) {
+        /* try to release all discarded copies and try again if succesful */
+        parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_owned_lru);
+        parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_lru);
+        if (active_w2r_tasks == 0) {
+            gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
+            if( NULL != gpu_task ) {
+                active_w2r_tasks++;
+                if (rc < 0) {
+                    goto get_data_out_of_device;
+                }
+            }
+        }
+    }
     rc = parsec_device_progress_stream( gpu_device,
                                         gpu_device->exec_stream[0],
                                         parsec_device_kernel_push,
@@ -2726,22 +2741,25 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         }
         assert(NULL == progress_task);
 
-        /* try to release all discarded copies and try again if succesful */
-        if (0 < parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_owned_lru)) {
-            gpu_task = NULL;
-            goto check_in_deps;
-        }
+        // go back up and evict some data
+        gpu_task = NULL;
+        goto check_in_deps;
     }
 
     /* If we can extract data go for it, otherwise try to drain the pending tasks.
      * Even we pushed the task correctly, we still may want to discard data from the device
      * in order to keep memory available. */
-    if (active_w2r_tasks == 0 && (rc < 0 || zone_watermark(gpu_device->memory) > parsec_device_gpu_mem_high_watermark)) {
-        gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
-        if( NULL != gpu_task ) {
-            active_w2r_tasks++;
-            if (rc < 0) {
-                goto get_data_out_of_device;
+    if ((rc < 0 || zone_watermark(gpu_device->memory) > parsec_device_gpu_mem_high_watermark)) {
+        /* try to release all discarded copies and try again if succesful */
+        parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_owned_lru);
+        parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_lru);
+        if (active_w2r_tasks == 0) {
+            gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
+            if( NULL != gpu_task ) {
+                active_w2r_tasks++;
+                if (rc < 0) {
+                    goto get_data_out_of_device;
+                }
             }
         }
     }
