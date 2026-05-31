@@ -22,9 +22,10 @@
 #include "parsec/utils/debug.h"
 #include "parsec/utils/argv.h"
 #include "parsec/utils/zone_malloc.h"
-#include "parsec/class/fifo.h"
+#include "parsec/class/lifo.h"
 #include "parsec/mca/device/level_zero/device_level_zero_dpcpp.h"
 
+#include <stddef.h>
 #include <level_zero/ze_api.h>
 
 static void* parsec_level_zero_find_incarnation(parsec_device_gpu_module_t* gpu_device,
@@ -413,9 +414,9 @@ int parsec_level_zero_module_init( int dev_id, parsec_device_level_zero_driver_t
     /* Initialize internal lists */
     PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_lru,       parsec_list_t);
     PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_owned_lru, parsec_list_t);
-    PARSEC_OBJ_CONSTRUCT(&gpu_device->pending,           parsec_fifo_t);
-
-    gpu_device->sort_starting_p = NULL;
+    PARSEC_OBJ_CONSTRUCT(&gpu_device->pending,           parsec_lifo_t);
+    parsec_rbtree_init(&gpu_device->pending_sorted,
+                       offsetof(parsec_gpu_task_t, pq_priority));
     gpu_device->peer_access_mask = 0;  /* No GPU to GPU direct transfer by default */
 
     device->memory_register          = NULL; // TODO there seem to be no memory pinning in level_zero?
@@ -503,6 +504,7 @@ parsec_level_zero_module_fini(parsec_device_module_t* device)
 
     /* Release pending queue */
     PARSEC_OBJ_DESTRUCT(&gpu_device->pending);
+    parsec_rbtree_fini(&gpu_device->pending_sorted);
 
     /* Release all streams */
     for( j = 0; j < gpu_device->num_exec_streams; j++ ) {

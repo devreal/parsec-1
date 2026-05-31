@@ -225,6 +225,13 @@ parsec_rbtree_node_t* parsec_rbtree_minimum(parsec_rbtree_t *tree, parsec_rbtree
     return x;
 }
 
+parsec_rbtree_node_t* parsec_rbtree_maximum(parsec_rbtree_t *tree, parsec_rbtree_node_t *x) {
+    while (RIGHT(x) != tree->nil) {
+        x = RIGHT(x);
+    }
+    return x;
+}
+
 void parsec_rbtree_remove(parsec_rbtree_t *tree, parsec_rbtree_node_t *z) {
     parsec_rbtree_node_t *y = z;
     parsec_rbtree_node_t *x;

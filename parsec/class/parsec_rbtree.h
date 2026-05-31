@@ -39,6 +39,8 @@ void parsec_rbtree_insert(parsec_rbtree_t *tree, parsec_rbtree_node_t *node);
 
 parsec_rbtree_node_t* parsec_rbtree_minimum(parsec_rbtree_t *tree, parsec_rbtree_node_t *x);
 
+parsec_rbtree_node_t* parsec_rbtree_maximum(parsec_rbtree_t *tree, parsec_rbtree_node_t *x);
+
 void parsec_rbtree_remove(parsec_rbtree_t *tree, parsec_rbtree_node_t *z);
 
 parsec_rbtree_node_t* parsec_rbtree_find(parsec_rbtree_t *tree, int data);

@@ -14,11 +14,11 @@
 
 #include "parsec/class/list_item.h"
 #include "parsec/class/list.h"
-#include "parsec/class/fifo.h"
+#include "parsec/class/lifo.h"
+#include "parsec/class/parsec_rbtree.h"
 
 BEGIN_C_DECLS
 
-#define PARSEC_GPU_USE_PRIORITIES     1
 #define PARSEC_GPU_MAX_STREAMS        6
 #define PARSEC_MAX_EVENTS_PER_STREAM  4
 #define PARSEC_GPU_MAX_WORKSPACE      2
@@ -115,7 +115,8 @@ typedef struct parsec_gpu_flow_info_s {
 } parsec_gpu_flow_info_t;
 
 struct parsec_gpu_task_s {
-    parsec_list_item_t                     list_item;
+    parsec_rbtree_node_t                   super;        /**< list_item for list/lifo ops; rbtree node for priority queue */
+    int32_t                                pq_priority;  /**< cached priority key used by the rbtree comparator */
     uint16_t                               task_type;
     uint16_t                               pushout;
     int32_t                                last_status;
@@ -269,9 +270,9 @@ struct parsec_device_gpu_module_s {
                                                    */
     parsec_list_t              gpu_mem_lru;   /* Read-only blocks, and fresh blocks */
     parsec_list_t              gpu_mem_owned_lru;  /* Dirty blocks */
-    parsec_fifo_t              pending;
+    parsec_lifo_t              pending;          /**< lock-free insertion queue for non-manager threads */
+    parsec_rbtree_t            pending_sorted;   /**< priority-sorted staging area; drained from pending by the manager */
     struct zone_malloc_s      *memory;
-    parsec_list_item_t        *sort_starting_p;
     parsec_gpu_exec_stream_t **exec_stream;
     size_t                     mem_block_size;
     int64_t                    mem_nb_blocks;
@@ -333,7 +334,6 @@ void* parsec_device_pop_workspace(parsec_device_gpu_module_t* gpu_device, parsec
 int parsec_device_free_workspace(parsec_device_gpu_module_t * gpu_device);
 
 /* sort pending task list by number of spaces needed */
-int parsec_device_sort_pending_list(parsec_device_module_t *gpu_device);
 parsec_gpu_task_t* parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_execution_stream_t *es);
 int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_gpu_task_t *w2r_task, parsec_execution_stream_t *es);
 

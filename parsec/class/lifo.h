@@ -166,6 +166,24 @@ LIFO_STATIC_INLINE parsec_list_item_t*
 parsec_lifo_nolock_pop(parsec_lifo_t* lifo);
 
 /**
+ * @brief Atomically detach all elements from the LIFO and return them as a ring.
+ *
+ * @details Atomically replaces the LIFO head with NULL and returns all
+ *   previously held items as a doubly-linked ring.  Items are ordered
+ *   with the most-recently-pushed element first (same order as repeated
+ *   calls to parsec_lifo_pop).  Any items pushed concurrently after the
+ *   atomic exchange remain in the LIFO and are not included.
+ *
+ * @param[inout] lifo the LIFO to drain
+ * @return NULL if the LIFO was empty; otherwise a ring of all items that
+ *         were in the LIFO at the moment of the call.
+ *
+ * @remark this function is thread safe
+ */
+LIFO_STATIC_INLINE parsec_list_item_t*
+parsec_lifo_detach_all(parsec_lifo_t* lifo);
+
+/**
  * @cond FALSE
  ***********************************************************************
  * Interface is defined. Everything else is private thereafter
@@ -230,6 +248,25 @@ LIFO_STATIC_INLINE int parsec_lifo_is_empty( parsec_lifo_t* lifo )
 /* Same as above, we need an actual function in the external case */
 LIFO_STATIC_INLINE int parsec_lifo_nolock_is_empty( parsec_lifo_t* lifo ) {
     return (NULL == lifo->lifo_head.data.item);
+}
+
+/* Convert a NULL-terminated singly-linked LIFO chain into a doubly-linked
+ * ring by walking the chain once to set list_prev and close the cycle.
+ * head must be non-NULL. */
+static inline parsec_list_item_t*
+parsec_lifo_chain_to_ring(parsec_list_item_t *head)
+{
+    parsec_list_item_t *prev = head;
+    parsec_list_item_t *cur  = (parsec_list_item_t*)head->list_next;
+    while (NULL != cur) {
+        cur->list_prev = prev;
+        prev = cur;
+        cur  = (parsec_list_item_t*)cur->list_next;
+    }
+    /* prev is now the tail; close the ring */
+    prev->list_next = head;
+    head->list_prev = prev;
+    return head;
 }
 
 #if defined(PARSEC_ATOMIC_HAS_ATOMIC_CAS_INT128)
@@ -356,6 +393,19 @@ LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_try_pop( parsec_lifo_t* lifo 
     return NULL;
 }
 
+LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_detach_all( parsec_lifo_t* lifo )
+{
+    parsec_counted_pointer_t old_head;
+    do {
+        old_head.data.guard.counter = lifo->lifo_head.data.guard.counter;
+        parsec_atomic_rmb();
+        old_head.data.item = lifo->lifo_head.data.item;
+        if (NULL == old_head.data.item) return NULL;
+    } while (!parsec_update_counted_pointer(&lifo->lifo_head, old_head, NULL));
+    parsec_atomic_wmb();
+    return parsec_lifo_chain_to_ring(old_head.data.item);
+}
+
 #elif defined(PARSEC_ATOMIC_HAS_ATOMIC_LLSC_PTR)
 
 LIFO_STATIC_INLINE void _parsec_lifo_release_cpu (void)
@@ -468,6 +518,21 @@ LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_try_pop( parsec_lifo_t* lifo 
     return item;
 }
 
+LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_detach_all( parsec_lifo_t* lifo )
+{
+    parsec_list_item_t *head;
+    int attempt = 0;
+    do {
+        if (++attempt == 5) {
+            _parsec_lifo_release_cpu();
+            attempt = 0;
+        }
+        head = (parsec_list_item_t*)parsec_atomic_ll_ptr((long*)&lifo->lifo_head.data.item);
+        if (NULL == head) return NULL;
+    } while (!parsec_atomic_sc_ptr((long*)&lifo->lifo_head.data.item, (intptr_t)NULL));
+    parsec_atomic_wmb();
+    return parsec_lifo_chain_to_ring(head);
+}
 
 #else /* defined(PARSEC_ATOMIC_HAS_ATOMIC_CAS_INT128) || defined(PARSEC_ATOMIC_HAS_ATOMIC_LLSC_PTR) */
 
@@ -547,6 +612,18 @@ LIFO_STATIC_INLINE parsec_list_item_t *parsec_lifo_try_pop(parsec_lifo_t* lifo)
     return item;
 }
 
+LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_detach_all( parsec_lifo_t* lifo )
+{
+    parsec_list_item_t *head;
+    if (NULL == lifo->lifo_head.data.item) return NULL;
+    parsec_atomic_lock(&lifo->lifo_head.data.guard.lock);
+    head = lifo->lifo_head.data.item;
+    lifo->lifo_head.data.item = NULL;
+    parsec_atomic_unlock(&lifo->lifo_head.data.guard.lock);
+    if (NULL == head) return NULL;
+    return parsec_lifo_chain_to_ring(head);
+}
+
 #endif  /* defined(PARSEC_ATOMIC_HAS_ATOMIC_CAS_INT128) || defined(PARSEC_ATOMIC_HAS_ATOMIC_LLSC_PTR) */
 
 LIFO_STATIC_INLINE void parsec_lifo_nolock_push( parsec_lifo_t* lifo,
@@ -581,6 +658,14 @@ LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_nolock_pop( parsec_lifo_t* li
     lifo->lifo_head.data.item = (parsec_list_item_t*)item->list_next;
     PARSEC_ITEM_DETACH(item);
     return item;
+}
+
+LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_nolock_detach_all( parsec_lifo_t* lifo )
+{
+    parsec_list_item_t *head = lifo->lifo_head.data.item;
+    if (NULL == head) return NULL;
+    lifo->lifo_head.data.item = NULL;
+    return parsec_lifo_chain_to_ring(head);
 }
 
 /**
