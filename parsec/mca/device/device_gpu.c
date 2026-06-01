@@ -3468,20 +3468,18 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
 
  fetch_task_from_shared_queue:
     assert( NULL == gpu_task );
-    /* Atomically detach all pending tasks as a ring, then insert each into
-     * the priority-sorted tree. One atomic exchange replaces N pop calls. */
+    /* Atomically detach all pending tasks as a ring, set their priorities,
+     * then bulk-insert into the priority-sorted tree. */
     {
         parsec_list_item_t *ring = parsec_lifo_detach_all(&gpu_device->pending);
         if (NULL != ring) {
             parsec_list_item_t *litem = ring;
             do {
-                parsec_list_item_t *next = (parsec_list_item_t*)litem->list_next;
-                parsec_gpu_task_t  *task = (parsec_gpu_task_t*)litem;
-                PARSEC_LIST_ITEM_SINGLETON(litem);
+                parsec_gpu_task_t *task = (parsec_gpu_task_t*)litem;
                 task->pq_priority = (task->ec != NULL) ? task->ec->priority : 0;
-                parsec_rbtree_insert(&gpu_device->pending_sorted, &task->super);
-                litem = next;
+                litem = (parsec_list_item_t*)litem->list_next;
             } while (litem != ring);
+            parsec_rbtree_insert_ring(&gpu_device->pending_sorted, (parsec_rbtree_node_t*)ring);
         }
     }
     if( gpu_device->pending_sorted.root != gpu_device->pending_sorted.nil ) {

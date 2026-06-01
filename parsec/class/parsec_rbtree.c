@@ -38,6 +38,7 @@ void parsec_rbtree_init(parsec_rbtree_t* tree, size_t offset) {
     tree->nil = &tree->nil_element;
     tree->root = tree->nil;
     tree->comp_offset = offset;
+    tree->count = 0;
 }
 
 void parsec_rbtree_fini(parsec_rbtree_t* tree) {
@@ -150,6 +151,7 @@ void parsec_rbtree_insert(parsec_rbtree_t *tree, parsec_rbtree_node_t *node) {
     RIGHT(z) = tree->nil;
     z->color = PARSEC_RBTREE_RED;
     parsec_rbtree_insert_fixup(tree, z);
+    tree->count++;
 }
 
 static void parsec_rbtree_delete_fixup(parsec_rbtree_t *tree, parsec_rbtree_node_t *x) {
@@ -261,6 +263,11 @@ void parsec_rbtree_remove(parsec_rbtree_t *tree, parsec_rbtree_node_t *z) {
     if (y_original_color == PARSEC_RBTREE_BLACK) {
         parsec_rbtree_delete_fixup(tree, x);
     }
+    /* Reset the removed node to a clean detached state so callers can
+     * safely use its list_item links without seeing stale tree pointers. */
+    LEFT(z) = RIGHT(z) = z->parent = tree->nil;
+    z->color = PARSEC_RBTREE_BLACK;
+    tree->count--;
 }
 
 parsec_rbtree_node_t* parsec_rbtree_find(parsec_rbtree_t *tree, int data) {
@@ -372,4 +379,164 @@ void parsec_rbtree_foreach(parsec_rbtree_t *tree, parsec_rbtree_visitor_cb *fn, 
     if (NULL != tree) {
         parsec_rbtree_foreach_node(tree, tree->root, fn, cbdata);
     }
+}
+
+/* -----------------------------------------------------------------------
+ * parsec_rbtree_insert_ring helpers
+ * All temporary linking between nodes uses ->parent as a singly-linked
+ * "next" pointer, terminated by tree->nil.  LEFT/RIGHT are left free for
+ * the final tree construction.
+ * --------------------------------------------------------------------- */
+
+/* Merge two sorted parent-chains into one sorted parent-chain. */
+static parsec_rbtree_node_t *
+rbtree_merge_chains(parsec_rbtree_t *tree,
+                    parsec_rbtree_node_t *a,
+                    parsec_rbtree_node_t *b)
+{
+    parsec_rbtree_node_t sentinel;
+    parsec_rbtree_node_t *tail = &sentinel;
+
+    while (a != tree->nil && b != tree->nil) {
+        if (COMPARISON_VAL(a, tree->comp_offset) <= COMPARISON_VAL(b, tree->comp_offset)) {
+            tail->parent = a; tail = a; a = a->parent;
+        } else {
+            tail->parent = b; tail = b; b = b->parent;
+        }
+    }
+    tail->parent = (a != tree->nil) ? a : b;
+    return sentinel.parent;
+}
+
+/* Merge-sort a parent-chain using fast/slow pointer split. */
+static parsec_rbtree_node_t *
+rbtree_mergesort(parsec_rbtree_t *tree, parsec_rbtree_node_t *head)
+{
+    if (head == tree->nil || head->parent == tree->nil) return head;
+
+    parsec_rbtree_node_t *slow = head, *fast = head->parent;
+    while (fast != tree->nil && fast->parent != tree->nil) {
+        slow = slow->parent;
+        fast = fast->parent->parent;
+    }
+    parsec_rbtree_node_t *second = slow->parent;
+    slow->parent = tree->nil;  /* split */
+
+    return rbtree_merge_chains(tree,
+                               rbtree_mergesort(tree, head),
+                               rbtree_mergesort(tree, second));
+}
+
+/* Drain the existing tree into a sorted parent-chain via Morris in-order
+ * traversal (O(M) time, O(1) extra space).  Resets tree->root to nil. */
+static parsec_rbtree_node_t *
+rbtree_tree_to_chain(parsec_rbtree_t *tree, size_t *count_out)
+{
+    parsec_rbtree_node_t sentinel;
+    sentinel.parent = tree->nil;
+    parsec_rbtree_node_t *tail = &sentinel;
+    parsec_rbtree_node_t *cur  = tree->root;
+    size_t count = 0;
+
+    while (cur != tree->nil) {
+        if (LEFT(cur) == tree->nil) {
+            tail->parent = cur; tail = cur; count++;
+            cur = RIGHT(cur);
+        } else {
+            parsec_rbtree_node_t *pred = LEFT(cur);
+            while (RIGHT(pred) != tree->nil && RIGHT(pred) != cur)
+                pred = RIGHT(pred);
+            if (RIGHT(pred) == tree->nil) {
+                RIGHT(pred) = cur;           /* create thread */
+                cur = LEFT(cur);
+            } else {
+                RIGHT(pred) = tree->nil;     /* remove thread */
+                tail->parent = cur; tail = cur; count++;
+                cur = RIGHT(cur);
+            }
+        }
+    }
+    tail->parent = tree->nil;
+    tree->root   = tree->nil;
+    *count_out   = count;
+    return sentinel.parent;
+}
+
+static int rbtree_log2_floor(size_t n)
+{
+    int r = 0;
+    while (n > 1) { n >>= 1; r++; }
+    return r;
+}
+
+/* Recursively build a balanced RB-tree from a sorted parent-chain.
+ * chain: pointer to the "current head" of the remaining chain (updated in place).
+ * depth / max_black_depth: nodes at depth <= max_black_depth are BLACK, deeper are RED.
+ */
+static parsec_rbtree_node_t *
+rbtree_build_rec(parsec_rbtree_t *tree, parsec_rbtree_node_t **chain,
+                 size_t count, int depth, int max_black_depth)
+{
+    if (count == 0) return tree->nil;
+
+    size_t l = (count - 1) / 2;
+    size_t r = count - 1 - l;
+
+    parsec_rbtree_node_t *left  = rbtree_build_rec(tree, chain, l, depth + 1, max_black_depth);
+    parsec_rbtree_node_t *node  = *chain;
+    *chain = (*chain)->parent;
+    parsec_rbtree_node_t *right = rbtree_build_rec(tree, chain, r, depth + 1, max_black_depth);
+
+    LEFT(node)  = left;
+    RIGHT(node) = right;
+    if (left  != tree->nil) left->parent  = node;
+    if (right != tree->nil) right->parent = node;
+    node->color = (depth <= max_black_depth) ? PARSEC_RBTREE_BLACK : PARSEC_RBTREE_RED;
+
+    return node;
+}
+
+void parsec_rbtree_insert_ring(parsec_rbtree_t *tree, parsec_rbtree_node_t *ring)
+{
+    /* Phase A: convert ring to a nil-terminated parent-chain and sort it.
+     * Iterate forward via RIGHT (= list_next); find tail via LEFT (= list_prev). */
+    size_t ring_count = 0;
+    parsec_rbtree_node_t *cur = ring;
+    do {
+        parsec_rbtree_node_t *next = RIGHT(cur);
+        cur->parent = (next == ring) ? tree->nil : next;
+        LEFT(cur)   = tree->nil;
+        RIGHT(cur)  = tree->nil;
+        ring_count++;
+        cur = next;
+    } while (cur != ring);
+
+    /* Cutoff: if the ring is small relative to the existing tree, individual
+     * insertions are cheaper than a full merge-rebuild. */
+    if (ring_count < (size_t)rbtree_log2_floor(tree->count + 1)) {
+        /* Re-insert individually; nodes are now nil-chained via parent. */
+        parsec_rbtree_node_t *node = ring;
+        while (node != tree->nil) {
+            parsec_rbtree_node_t *next = node->parent;
+            parsec_rbtree_insert(tree, node);
+            node = next;
+        }
+        return;
+    }
+
+    parsec_rbtree_node_t *ring_chain = rbtree_mergesort(tree, ring);
+
+    /* Phase B: drain existing tree to sorted parent-chain. */
+    size_t tree_count = 0;
+    parsec_rbtree_node_t *tree_chain = rbtree_tree_to_chain(tree, &tree_count);
+
+    /* Phase C: merge chains and rebuild. */
+    parsec_rbtree_node_t *merged = rbtree_merge_chains(tree, ring_chain, tree_chain);
+    size_t total = ring_count + tree_count;
+    int max_bk   = rbtree_log2_floor(total + 1) - 1;
+
+    tree->root = rbtree_build_rec(tree, &merged, total, 0, max_bk);
+    if (tree->root != tree->nil)
+        tree->root->parent = tree->nil;
+    tree->count = total;
 }
