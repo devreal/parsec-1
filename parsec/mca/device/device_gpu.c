@@ -3,6 +3,7 @@
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
  * Copyright (c) 2024-2026 NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2026      Stony Brook University. All rights reserved.
  */
 
 #include "parsec/parsec_config.h"
@@ -189,6 +190,7 @@ static void parsec_device_task_t_constructor(parsec_gpu_task_t *gpu_task)
     gpu_task->last_data_check_epoch = UINT64_MAX; /* force at least one validation for the task */
     gpu_task->nb_flows = 0;
     gpu_task->flow_info = NULL;
+    gpu_task->priority = -1; // priority is inherited from the task
     /* Default release mechanism, can be replaced by the DSL */
     gpu_task->release_device_task = parsec_device_release_gpu_task;
 }
@@ -392,60 +394,6 @@ void parsec_device_enable_debug(void)
     }
 }
 
-int parsec_device_sort_pending_list(parsec_device_module_t *device)
-{
-    if( !PARSEC_DEV_IS_GPU(device->type) )
-        return 0;
-
-    parsec_device_gpu_module_t *gpu_device = (parsec_device_gpu_module_t *)device;
-    parsec_list_t *sort_list = gpu_device->exec_stream[0]->fifo_pending;
-
-    if (parsec_list_is_empty(sort_list) ) { /* list is empty */
-        return 0;
-    }
-
-    if (gpu_device->sort_starting_p == NULL || !parsec_list_nolock_contains(sort_list, gpu_device->sort_starting_p) ) {
-        gpu_device->sort_starting_p = (parsec_list_item_t*)sort_list->ghost_element.list_next;
-    }
-
-    /* p is head */
-    parsec_list_item_t *p = gpu_device->sort_starting_p;
-    int i, j, NB_SORT = 10, space_q, space_min;
-
-    parsec_list_item_t *q, *prev_p, *min_p;
-    for (i = 0; i < NB_SORT; i++) {
-        if ( p == &(sort_list->ghost_element) ) {
-            break;
-        }
-        min_p = p; /* assume the minimum one is the first one p */
-        q = (parsec_list_item_t*)min_p->list_next;
-        space_min = parsec_device_check_space_needed(gpu_device, (parsec_gpu_task_t*)min_p);
-        for (j = i+1; j < NB_SORT; j++) {
-            if ( q == &(sort_list->ghost_element) ) {
-                break;
-            }
-            space_q = parsec_device_check_space_needed(gpu_device, (parsec_gpu_task_t*)q);
-            if ( space_min > space_q ) {
-                min_p = q;
-                space_min = space_q;
-            }
-            q = (parsec_list_item_t*)q->list_next;
-
-        }
-        if (min_p != p) { /* minimum is not the first one, let's insert min_p before p */
-            /* take min_p out */
-            parsec_list_item_ring_chop(min_p);
-            PARSEC_LIST_ITEM_SINGLETON(min_p);
-            prev_p = (parsec_list_item_t*)p->list_prev;
-
-            /* insert min_p after prev_p */
-            parsec_list_add_after( sort_list, prev_p, min_p);
-        }
-        p = (parsec_list_item_t*)min_p->list_next;
-    }
-
-    return 0;
-}
 
 void* parsec_device_pop_workspace(parsec_device_gpu_module_t* gpu_device,
                                   parsec_gpu_exec_stream_t* gpu_stream, size_t size)
@@ -762,7 +710,7 @@ parsec_device_data_advise(parsec_device_module_t *dev, parsec_data_t *data, int 
                                  "GPU[%d:%s]: data copy %p [ref_count %d] linked to prefetch gpu task %p on GPU copy %p",
                                  gpu_device->super.device_index, gpu_device->super.name, gpu_task->ec->data[0].data_in, gpu_task->ec->data[0].data_in->super.super.obj_reference_count,
                                  gpu_task, gpu_task->ec->data[0].data_out);
-            parsec_fifo_push( &(gpu_device->pending), (parsec_list_item_t*)gpu_task );
+            parsec_lifo_push( &(gpu_device->pending), (parsec_list_item_t*)gpu_task );
             return PARSEC_SUCCESS;
         }
         break;
@@ -2164,19 +2112,6 @@ parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
     return 1;  /* positive returns have special meaning and are used for optimizations */
 }
 
-#if PARSEC_GPU_USE_PRIORITIES
-
-static inline parsec_list_item_t* parsec_device_push_task_ordered( parsec_list_t* list,
-                                                                   parsec_list_item_t* elem )
-{
-    parsec_list_push_sorted(list, elem, parsec_execution_context_priority_comparator);
-    return elem;
-}
-#define PARSEC_PUSH_TASK parsec_device_push_task_ordered
-#else
-#define PARSEC_PUSH_TASK parsec_list_push_back
-#endif
-
 static inline int
 parsec_gpu_task_is_singleton(parsec_gpu_task_t *task)
 {
@@ -2199,10 +2134,10 @@ parsec_gpu_stream_push_pending(parsec_gpu_exec_stream_t *stream,
      * order when feeding the tasks to the next stream.
      */
     if( !parsec_gpu_task_is_singleton(task) ) {
-        parsec_list_chain_back(stream->fifo_pending, &task->list_item);
+        parsec_list_nolock_chain_back(stream->fifo_pending, &task->list_item);
         return;
     }
-    PARSEC_PUSH_TASK(stream->fifo_pending, &task->list_item);
+    parsec_list_nolock_push_back(stream->fifo_pending, &task->list_item);
 }
 
 static inline int
@@ -2257,7 +2192,6 @@ parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
     fifo_pending = gpu_stream->fifo_pending;
     assert(NULL != fifo_pending);
 
-    parsec_list_lock(fifo_pending);
     for(item = (parsec_list_item_t *)fifo_pending->ghost_element.list_next;
         item != &fifo_pending->ghost_element;
         item = next) {
@@ -2270,7 +2204,6 @@ parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
         }
         rc = callback(candidate, batch_head, callback_data);
         if( rc < 0 ) {
-            parsec_list_unlock(fifo_pending);
             return rc;
         }
         if( 0 == rc ) {
@@ -2279,7 +2212,6 @@ parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
             nb_tasks++;
         }
     }
-    parsec_list_unlock(fifo_pending);
 
     return nb_tasks;
 }
@@ -2332,6 +2264,7 @@ parsec_device_send_transfercomplete_cmd_to_device(parsec_data_copy_t *copy,
     gpu_task->ec = calloc(1, sizeof(parsec_task_t));
     PARSEC_OBJ_CONSTRUCT(gpu_task->ec, parsec_task_t);
     gpu_task->ec->task_class = &parsec_device_d2d_complete_tc;
+    gpu_task->ec->priority = INT32_MAX; /* This task should be executed as soon as possible */
     gpu_task->nb_flows = 1;
     gpu_task->flow_info[0].flow = &parsec_device_d2d_complete_flow;
     gpu_task->flow_info[0].flow_span = copy->original->span;
@@ -2352,7 +2285,7 @@ parsec_device_send_transfercomplete_cmd_to_device(parsec_data_copy_t *copy,
                          current_dev->device_index, current_dev->name, gpu_task->ec->data[0].data_out,
                          gpu_task->ec->data[0].data_out->super.super.obj_reference_count,
                          dst_dev->device_index, dst_dev->name);
-    parsec_fifo_push( &(((parsec_device_gpu_module_t*)dst_dev)->pending), (parsec_list_item_t*)gpu_task );
+    parsec_lifo_push( &(((parsec_device_gpu_module_t*)dst_dev)->pending), (parsec_list_item_t*)gpu_task );
 }
 
 static int
@@ -2654,7 +2587,7 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
   grab_a_task:
     assert(NULL == task);
     if( NULL == stream->tasks[stream->start] ) {  /* there is room on the stream */
-        task = (parsec_gpu_task_t*)parsec_list_pop_front(stream->fifo_pending);  /* get the best task */
+        task = (parsec_gpu_task_t*)parsec_list_nolock_pop_front(stream->fifo_pending);  /* get the next task */
     }
     if( NULL == task ) {  /* No tasks, we're done */
         return PARSEC_HOOK_RETURN_DONE;
@@ -3395,6 +3328,10 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                                   PARSEC_PROFILING_EVENT_RESCHEDULED );
 #endif /* defined(PARSEC_PROF_TRACE) */
 
+    if (gpu_task != NULL && gpu_task->priority < 0) {
+        gpu_task->priority = (gpu_task->ec != NULL) ? gpu_task->ec->priority : 0;
+    }
+
     /* Check the GPU status -- three kinds of values for rc:
      *   - rc < 0: somebody is doing a short atomic operation while there is no manager,
      *             so wait.
@@ -3419,7 +3356,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         }
     }
     if( 0 < rc ) {
-        parsec_fifo_push( &(gpu_device->pending), (parsec_list_item_t*)gpu_task );
+        parsec_lifo_push( &(gpu_device->pending), (parsec_list_item_t*)gpu_task );
         return PARSEC_HOOK_RETURN_ASYNC;
     }
     PARSEC_DEBUG_VERBOSE(5, parsec_gpu_output_stream, "GPU[%d:%s]: Entering GPU management",
@@ -3536,16 +3473,16 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
 
  fetch_task_from_shared_queue:
     assert( NULL == gpu_task );
-    if (NULL != gpu_device->super.sort_pending_list && out_task_submit == NULL && out_task_pop == NULL) {
-        gpu_device->super.sort_pending_list(&gpu_device->super);
+    {
+        parsec_list_item_t *chain = parsec_lifo_detach_chain(&gpu_device->pending);
+        if (NULL != chain) {
+            parsec_heap_push_chain(&gpu_device->pending_heap, chain);
+        }
     }
-    gpu_task = (parsec_gpu_task_t*)parsec_fifo_try_pop( &(gpu_device->pending) );
+    gpu_task = (parsec_gpu_task_t*)parsec_heap_pop(&gpu_device->pending_heap);
     if( NULL != gpu_task ) {
         pop_null = 0;
-        /* parsec_fifo_try_pop() detaches the task but does not reset list links
-         * in release builds; normalize before the stream FIFO inspects them.
-         */
-        PARSEC_LIST_ITEM_SINGLETON((parsec_list_item_t*)gpu_task);
+        /* parsec_heap_push_ring() singletonizes each item; the popped task is already a singleton. */
         gpu_task->last_data_check_epoch = gpu_device->data_avail_epoch - 1;  /* force at least one tour */
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,  "GPU[%d:%s]:\tGet from shared queue %s", gpu_device->super.device_index, gpu_device->super.name,
                              parsec_device_describe_gpu_task(tmp, MAX_TASK_STRLEN, gpu_task));

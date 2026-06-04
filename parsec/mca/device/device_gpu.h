@@ -3,6 +3,7 @@
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
  * Copyright (c) 2024-2026 NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2026      Stony Brook University. All rights reserved.
  */
 
 #ifndef PARSEC_DEVICE_GPU_H
@@ -14,11 +15,11 @@
 
 #include "parsec/class/list_item.h"
 #include "parsec/class/list.h"
-#include "parsec/class/fifo.h"
+#include "parsec/class/lifo.h"
+#include "parsec/class/parsec_heap.h"
 
 BEGIN_C_DECLS
 
-#define PARSEC_GPU_USE_PRIORITIES     1
 #define PARSEC_GPU_MAX_STREAMS        6
 #define PARSEC_MAX_EVENTS_PER_STREAM  4
 #define PARSEC_GPU_MAX_WORKSPACE      2
@@ -116,6 +117,7 @@ typedef struct parsec_gpu_flow_info_s {
 
 struct parsec_gpu_task_s {
     parsec_list_item_t                     list_item;
+    int32_t                                priority; /**< device task priority, inherited from task if < 0 */
     uint16_t                               task_type;
     uint16_t                               pushout;
     int32_t                                last_status;
@@ -164,20 +166,20 @@ typedef enum parsec_device_transfer_direction_e {
 
 /**
  * @brief Set the device for the calling thread.
- * 
+ *
  * @details typically maps to cudaSetDevice or equivalent
- * 
+ *
  * @return PARSEC_SUCCESS or a PARSEC error
  */
 typedef int (*parsec_device_set_device_fn_t)(struct parsec_device_gpu_module_s *gpu);
 
 /**
  * @brief Schedules the asynchronous copy of @p bytes bytes from @p source onto @p dest
- *    on the GPU stream of @p gpu_stream. @p direction must reflect the memory space of 
+ *    on the GPU stream of @p gpu_stream. @p direction must reflect the memory space of
  *    @p source and @p dest.
- * 
+ *
  * @details typically maps to cudaMemcpyAsync or equivalent
- * 
+ *
  * @return PARSEC_SUCCESS or a PARSEC error
  */
 typedef int (*parsec_device_memcpy_async_fn_t)(struct parsec_device_gpu_module_s *gpu, struct parsec_gpu_exec_stream_s *gpu_stream,
@@ -185,20 +187,20 @@ typedef int (*parsec_device_memcpy_async_fn_t)(struct parsec_device_gpu_module_s
 
 /**
  * @brief Record an event on the GPU @p gpu_stream of GPU @p gpu, with index @p idx.
- * 
+ *
  * @details typically maps to cudaRecordEvent or equivalent. The GPU device must have allocated
- *    @p gpu_stream->super.max_events previously (@p 0 <= event_idx < gpu_stream->super.max_events). 
- * 
+ *    @p gpu_stream->super.max_events previously (@p 0 <= event_idx < gpu_stream->super.max_events).
+ *
  * @return PARSEC_SUCCESS or a PARSEC error
  */
 typedef int (*parsec_device_event_record_fn_t)(struct parsec_device_gpu_module_s *gpu, struct parsec_gpu_exec_stream_s *gpu_stream, int32_t event_idx);
 
 /**
  * @brief Record an event on the GPU @p gpu_stream of GPU @p gpu, with index @p idx.
- * 
+ *
  * @details typically maps to cudaRecordEvent or equivalent. The GPU device must have allocated
- *    @p gpu_stream->super.max_events previously (@p 0 <= event_idx < gpu_stream->super.max_events). 
- * 
+ *    @p gpu_stream->super.max_events previously (@p 0 <= event_idx < gpu_stream->super.max_events).
+ *
  * @return 0 if the event recorded at @p event_idx in @p gpu_stream is not ready yet
  *         1 if the event recorded at @p event_idx in @p gpu_stream is ready/completed
  *         a negative value which is a PARSEC error otherwise
@@ -209,34 +211,34 @@ typedef int (*parsec_device_event_query_fn_t)(struct parsec_device_gpu_module_s 
  * @brief Computes how much memory is available on the GPU. Returns two values:
  *   @p free_mem is the amount of memory available for this process
  *   @p total_mem is the amount of memory on the device (including memory allocated by other processes)
- * 
- * @details typically maps to cudaMemGetInfo or equivalent. 
- * 
+ *
+ * @details typically maps to cudaMemGetInfo or equivalent.
+ *
  * @return PARSEC_SUCCESS if successful, a PARSEC error otherwise (in which case the parameters are undefined)
  */
 typedef int (*parsec_device_memory_info_fn_t)(struct parsec_device_gpu_module_s *gpu, size_t *free_mem, size_t *total_mem);
 
 /**
  * @brief Allocates @p bytes bytes on GPU @p gpu, and returns the address of the allocated memory in @p addr.
- * 
- * @details typically maps to cudaMalloc or equivalent. 
- * 
+ *
+ * @details typically maps to cudaMalloc or equivalent.
+ *
  * @return PARSEC_SUCCESS if successful, a PARSEC error otherwise (in which case @p addr is undefined)
  */
 typedef int (*parsec_device_memory_allocate_fn_t)(struct parsec_device_gpu_module_s *gpu, size_t bytes, void **addr);
 
 /**
  * @brief Frees memory @p addr allocated by @fn parsec_device_memory_allocate_fn_t on the same GPU @p gpu.
- * 
- * @details typically maps to cudaFree or equivalent. 
- * 
+ *
+ * @details typically maps to cudaFree or equivalent.
+ *
  * @return PARSEC_SUCCESS if successful, a PARSEC error otherwise
  */
 typedef int (*parsec_device_memory_free_fn_t)(struct parsec_device_gpu_module_s *gpu, void *addr);
 
 /**
  * @brief Find a function incarnation for the given function name
- * 
+ *
  * @param gpu_device the target GPU
  * @param fname the function name to look for
  * @return address of the symbol that implements this function
@@ -269,9 +271,9 @@ struct parsec_device_gpu_module_s {
                                                    */
     parsec_list_t              gpu_mem_lru;   /* Read-only blocks, and fresh blocks */
     parsec_list_t              gpu_mem_owned_lru;  /* Dirty blocks */
-    parsec_fifo_t              pending;
+    parsec_lifo_t              pending;       /**< lock-free LIFO: CPU threads push here */
+    parsec_heap_t              pending_heap;  /**< manager-private max-heap for priority ordering */
     struct zone_malloc_s      *memory;
-    parsec_list_item_t        *sort_starting_p;
     parsec_gpu_exec_stream_t **exec_stream;
     size_t                     mem_block_size;
     int64_t                    mem_nb_blocks;
@@ -332,8 +334,6 @@ int parsec_device_push_workspace(parsec_device_gpu_module_t* gpu_device, parsec_
 void* parsec_device_pop_workspace(parsec_device_gpu_module_t* gpu_device, parsec_gpu_exec_stream_t* gpu_stream, size_t size);
 int parsec_device_free_workspace(parsec_device_gpu_module_t * gpu_device);
 
-/* sort pending task list by number of spaces needed */
-int parsec_device_sort_pending_list(parsec_device_module_t *gpu_device);
 parsec_gpu_task_t* parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_execution_stream_t *es);
 int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_gpu_task_t *w2r_task, parsec_execution_stream_t *es);
 

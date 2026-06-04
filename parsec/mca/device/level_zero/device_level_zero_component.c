@@ -3,6 +3,7 @@
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
  * Copyright (c) 2024      NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2026      Stony Brook University. All rights reserved.
  */
 
 #include "parsec.h"
@@ -40,7 +41,6 @@ int parsec_level_zero_memory_block_size, parsec_level_zero_memory_percentage, pa
 char* parsec_level_zero_lib_path = NULL;
 
 static int level_zero_mask, level_zero_nvlink_mask;
-static int parsec_level_zero_sort_pending;
 
 #if defined(PARSEC_PROF_TRACE)
 int parsec_device_level_zero_one_profiling_stream_per_gpu_stream = 0;
@@ -167,9 +167,6 @@ static int device_level_zero_component_query(mca_base_module_t **module, int *pr
                     }
                     driver->ref_count++;
                     parsec_device_level_zero_component.modules[j]->component = &parsec_device_level_zero_component;
-                    if(parsec_level_zero_sort_pending) {
-                        parsec_device_level_zero_component.modules[j]->sort_pending_list = parsec_device_sort_pending_list;
-                    }
                     j++;  /* next available spot */
                     parsec_device_level_zero_component.modules[j] = NULL;
                     i++;
@@ -275,9 +272,6 @@ static int device_level_zero_component_register(void)
     (void)parsec_mca_param_reg_int_name("device_level_zero", "max_streams",
                                         "Maximum number of Streams to use for the GPU engine; 2 streams are used for communication between host and device, so the minimum is 3",
                                         false, false, PARSEC_GPU_MAX_STREAMS, &parsec_level_zero_max_streams);
-    (void)parsec_mca_param_reg_int_name("device_level_zero", "sort_pending_tasks",
-                                        "Boolean to let the GPU engine sort the first pending tasks stored in the list",
-                                        false, false, 0, &parsec_level_zero_sort_pending);
 #if defined(PARSEC_PROF_TRACE)
     (void)parsec_mca_param_reg_int_name("device_level_zero", "one_profiling_stream_per_level_zero_stream",
                                         "Boolean to separate the profiling of each level_zero stream into a single profiling stream",

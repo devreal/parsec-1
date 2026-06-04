@@ -2,6 +2,7 @@
  * Copyright (c) 2009-2023 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
+ * Copyright (c) 2026      Stony Brook University. All rights reserved.
  */
 
 #ifndef LIFO_H_HAS_BEEN_INCLUDED
@@ -232,6 +233,20 @@ LIFO_STATIC_INLINE int parsec_lifo_nolock_is_empty( parsec_lifo_t* lifo ) {
     return (NULL == lifo->lifo_head.data.item);
 }
 
+/* Detach all elements in the chain */
+#if defined(PARSEC_DEBUG_PARANOID)
+#define PARSEC_CHAIN_DETACH(item) {                                              \
+    parsec_list_item_t *_item = (item);                                          \
+    while (_item != NULL) {                                                      \
+        parsec_list_item_t *next = (parsec_list_item_t *) _item->list_next;      \
+        PARSEC_ITEM_DETACH(_item);                                               \
+        _item = next;                                                            \
+    }                                                                            \
+}
+#else
+#define PARSEC_CHAIN_DETACH(item) do { (void)(item); } while(0)
+#endif
+
 #if defined(PARSEC_ATOMIC_HAS_ATOMIC_CAS_INT128)
 /* Add one element to the FIFO. Returns true if successful, false otherwise.
  */
@@ -356,6 +371,29 @@ LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_try_pop( parsec_lifo_t* lifo 
     return NULL;
 }
 
+LIFO_STATIC_INLINE parsec_list_item_t *
+parsec_lifo_detach_chain(parsec_lifo_t *lifo)
+{
+    parsec_counted_pointer_t old_head;
+    do {
+        old_head.data.guard.counter = lifo->lifo_head.data.guard.counter;
+        parsec_atomic_rmb();
+        old_head.data.item = lifo->lifo_head.data.item;
+        if (NULL == old_head.data.item) return NULL;
+    } while (!parsec_update_counted_pointer(&lifo->lifo_head, old_head, NULL));
+    parsec_atomic_wmb();
+    parsec_list_item_t *item = old_head.data.item;
+#if defined(PARSEC_DEBUG_PARANOID)
+    while (item != NULL) {
+        parsec_list_item_t *next = (parsec_list_item_t *) item->list_next;
+        PARSEC_ITEM_DETACH(item);
+        item = next;
+    }
+#endif
+    PARSEC_CHAIN_DETACH(item);
+    return item;
+}
+
 #elif defined(PARSEC_ATOMIC_HAS_ATOMIC_LLSC_PTR)
 
 LIFO_STATIC_INLINE void _parsec_lifo_release_cpu (void)
@@ -468,6 +506,23 @@ LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_try_pop( parsec_lifo_t* lifo 
     return item;
 }
 
+LIFO_STATIC_INLINE parsec_list_item_t *
+parsec_lifo_detach_chain(parsec_lifo_t *lifo)
+{
+    parsec_list_item_t *item;
+    int attempt = 0;
+    do {
+        if (++attempt == 5) {
+            _parsec_lifo_release_cpu();
+            attempt = 0;
+        }
+        item = (parsec_list_item_t *)parsec_atomic_ll_ptr((long *)&lifo->lifo_head.data.item);
+        if (NULL == item) return NULL;
+    } while (!parsec_atomic_sc_ptr((long *)&lifo->lifo_head.data.item, (intptr_t)NULL));
+    parsec_atomic_wmb();
+    PARSEC_CHAIN_DETACH(item);
+    return item;
+}
 
 #else /* defined(PARSEC_ATOMIC_HAS_ATOMIC_CAS_INT128) || defined(PARSEC_ATOMIC_HAS_ATOMIC_LLSC_PTR) */
 
@@ -547,6 +602,18 @@ LIFO_STATIC_INLINE parsec_list_item_t *parsec_lifo_try_pop(parsec_lifo_t* lifo)
     return item;
 }
 
+LIFO_STATIC_INLINE parsec_list_item_t *
+parsec_lifo_detach_chain(parsec_lifo_t *lifo)
+{
+    parsec_list_item_t *item;
+    parsec_atomic_lock(&lifo->lifo_head.data.guard.lock);
+    item = lifo->lifo_head.data.item;
+    lifo->lifo_head.data.item = NULL;
+    parsec_atomic_unlock(&lifo->lifo_head.data.guard.lock);
+    PARSEC_CHAIN_DETACH(item);
+    return item;
+}
+
 #endif  /* defined(PARSEC_ATOMIC_HAS_ATOMIC_CAS_INT128) || defined(PARSEC_ATOMIC_HAS_ATOMIC_LLSC_PTR) */
 
 LIFO_STATIC_INLINE void parsec_lifo_nolock_push( parsec_lifo_t* lifo,
@@ -580,6 +647,15 @@ LIFO_STATIC_INLINE parsec_list_item_t* parsec_lifo_nolock_pop( parsec_lifo_t* li
     parsec_list_item_t* item = lifo->lifo_head.data.item;
     lifo->lifo_head.data.item = (parsec_list_item_t*)item->list_next;
     PARSEC_ITEM_DETACH(item);
+    return item;
+}
+
+LIFO_STATIC_INLINE parsec_list_item_t *
+parsec_lifo_nolock_detach_chain(parsec_lifo_t *lifo)
+{
+    parsec_list_item_t *item = lifo->lifo_head.data.item;
+    lifo->lifo_head.data.item = NULL;
+    PARSEC_CHAIN_DETACH(item);
     return item;
 }
 

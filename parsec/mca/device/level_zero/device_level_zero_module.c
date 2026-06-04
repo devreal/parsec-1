@@ -2,6 +2,7 @@
  * Copyright (c) 2023-2024 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
+ * Copyright (c) 2026      Stony Brook University. All rights reserved.
  */
 
 #include "parsec/parsec_config.h"
@@ -22,7 +23,9 @@
 #include "parsec/utils/debug.h"
 #include "parsec/utils/argv.h"
 #include "parsec/utils/zone_malloc.h"
-#include "parsec/class/fifo.h"
+#include "parsec/class/lifo.h"
+#include "parsec/class/parsec_heap.h"
+#include <stddef.h>
 #include "parsec/mca/device/level_zero/device_level_zero_dpcpp.h"
 
 #include <level_zero/ze_api.h>
@@ -413,9 +416,9 @@ int parsec_level_zero_module_init( int dev_id, parsec_device_level_zero_driver_t
     /* Initialize internal lists */
     PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_lru,       parsec_list_t);
     PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_owned_lru, parsec_list_t);
-    PARSEC_OBJ_CONSTRUCT(&gpu_device->pending,           parsec_fifo_t);
+    PARSEC_OBJ_CONSTRUCT(&gpu_device->pending, parsec_lifo_t);
+    parsec_heap_init(&gpu_device->pending_heap, offsetof(parsec_gpu_task_t, priority));
 
-    gpu_device->sort_starting_p = NULL;
     gpu_device->peer_access_mask = 0;  /* No GPU to GPU direct transfer by default */
 
     device->memory_register          = NULL; // TODO there seem to be no memory pinning in level_zero?
@@ -501,8 +504,9 @@ parsec_level_zero_module_fini(parsec_device_module_t* device)
     /* Release the registered memory */
     parsec_device_memory_release(gpu_device);
 
-    /* Release pending queue */
+    /* Release pending queue and heap */
     PARSEC_OBJ_DESTRUCT(&gpu_device->pending);
+    parsec_heap_fini(&gpu_device->pending_heap);
 
     /* Release all streams */
     for( j = 0; j < gpu_device->num_exec_streams; j++ ) {

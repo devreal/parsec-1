@@ -25,7 +25,7 @@
 #include "parsec/parsec_hwloc.h"
 #include "parsec/papi_sde.h"
 
-#define parsec_heap_priority_comparator (offsetof(parsec_heap_t, priority))
+#define parsec_heap_priority_comparator (offsetof(parsec_task_heap_t, priority))
 
 /**
  * Module functions
@@ -163,8 +163,8 @@ static parsec_task_t*
 sched_ltq_select(parsec_execution_stream_t *es,
                  int32_t* distance)
 {
-    parsec_heap_t* heap = NULL;
-    parsec_heap_t* new_heap = NULL;
+    parsec_task_heap_t* heap = NULL;
+    parsec_task_heap_t* new_heap = NULL;
     parsec_task_t * task = NULL;
     int i = 0;
     /*
@@ -173,7 +173,7 @@ sched_ltq_select(parsec_execution_stream_t *es,
      and choose a tree that has the highest value
      then take that task from that tree.
      */
-    heap = (parsec_heap_t*)parsec_hbbuffer_pop_best(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->task_queue,
+    heap = (parsec_task_heap_t*)parsec_hbbuffer_pop_best(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->task_queue,
                                                     parsec_heap_priority_comparator);
     task = heap_remove(&heap);
     if( NULL != heap ) {
@@ -187,7 +187,7 @@ sched_ltq_select(parsec_execution_stream_t *es,
 
     // if we failed to find one in our queue
     for(i = 1; i <  PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->nb_hierarch_queues; i++ ) {
-        heap = (parsec_heap_t*)parsec_hbbuffer_pop_best(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->hierarch_queues[i], parsec_heap_priority_comparator);
+        heap = (parsec_task_heap_t*)parsec_hbbuffer_pop_best(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->hierarch_queues[i], parsec_heap_priority_comparator);
         task = heap_split_and_steal(&heap, &new_heap);
         if( NULL != heap ) {
             if (NULL != new_heap) {
@@ -215,7 +215,7 @@ sched_ltq_select(parsec_execution_stream_t *es,
     }
 
     // if nothing yet, then go to system queue
-    heap = (parsec_heap_t *)parsec_dequeue_pop_front(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->system_queue);
+    heap = (parsec_task_heap_t *)parsec_dequeue_pop_front(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->system_queue);
     task = heap_split_and_steal(&heap, &new_heap);
 #if defined(PARSEC_PAPI_SDE)
     if( NULL != task ) {
@@ -224,7 +224,7 @@ sched_ltq_select(parsec_execution_stream_t *es,
 #endif
     if (heap != NULL) {
 #if defined(PARSEC_PAPI_SDE)
-        PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->local_system_queue_balance-= heap->size;
+        PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->local_system_queue_balance -= (int32_t)heap->heap.size;
 #endif
         parsec_hbbuffer_push_all(PARSEC_MCA_SCHED_LOCAL_QUEUES_OBJECT(es)->task_queue,
                                  (parsec_list_item_t*)heap, 0);
@@ -239,8 +239,8 @@ static int sched_ltq_schedule(parsec_execution_stream_t* es,
 {
     parsec_task_t * cur = new_context;
     parsec_task_t * next;
-    parsec_heap_t* heap = heap_create();
-    parsec_heap_t* first_h = heap;
+    parsec_task_heap_t* heap = heap_create();
+    parsec_task_heap_t* first_h = heap;
     int matches = 0;
     int i, j;
 
@@ -272,7 +272,7 @@ static int sched_ltq_schedule(parsec_execution_stream_t* es,
 
         if (!matches) {
             // make new heap
-            parsec_heap_t * new_heap = heap_create();
+            parsec_task_heap_t * new_heap = heap_create();
             heap->list_item.list_next->list_prev = (parsec_list_item_t*)new_heap;
             new_heap->list_item.list_prev = (parsec_list_item_t*)heap;
             new_heap->list_item.list_next = (parsec_list_item_t*)heap->list_item.list_next;

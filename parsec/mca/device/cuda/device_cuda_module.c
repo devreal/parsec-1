@@ -3,6 +3,7 @@
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
  * Copyright (c) 2024-2026 NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2026      Stony Brook University. All rights reserved.
  */
 
 #include "parsec/parsec_config.h"
@@ -23,7 +24,9 @@
 #include "parsec/utils/debug.h"
 #include "parsec/utils/argv.h"
 #include "parsec/utils/zone_malloc.h"
-#include "parsec/class/fifo.h"
+#include "parsec/class/lifo.h"
+#include "parsec/class/parsec_heap.h"
+#include <stddef.h>
 
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -161,7 +164,7 @@ static int parsec_cuda_all_devices_attached(parsec_device_module_t *device)
     for( int j = 0; NULL != (target_gpu = (parsec_device_cuda_module_t*)parsec_device_cuda_component.modules[j]); j++ ) {
         if( target_gpu == source_gpu ) {
             /* always set bit for self-access */
-            source_gpu->super.peer_access_mask = (int16_t)(source_gpu->super.peer_access_mask | 
+            source_gpu->super.peer_access_mask = (int16_t)(source_gpu->super.peer_access_mask |
                 (int16_t)(1 << target_gpu->super.super.device_index));
             continue;
         }
@@ -173,7 +176,7 @@ static int parsec_cuda_all_devices_attached(parsec_device_module_t *device)
             cudastatus = cudaDeviceEnablePeerAccess( target_gpu->cuda_index, 0 );
             PARSEC_CUDA_CHECK_ERROR( "(parsec_device_cuda_component_query) cuCtxEnablePeerAccess", cudastatus,
                                      {continue;} );
-            source_gpu->super.peer_access_mask = (int16_t)(source_gpu->super.peer_access_mask | 
+            source_gpu->super.peer_access_mask = (int16_t)(source_gpu->super.peer_access_mask |
                 (int16_t)(1 << target_gpu->super.super.device_index));
         }
     }
@@ -416,7 +419,7 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
     double fp16, fp32, fp64, tf32;
     struct cudaDeviceProp prop;
 
-    show_caps_index = parsec_mca_param_find("device", NULL, "show_capabilities"); 
+    show_caps_index = parsec_mca_param_find("device", NULL, "show_capabilities");
     if(0 < show_caps_index) {
         parsec_mca_param_lookup_int(show_caps_index, &show_caps);
     }
@@ -510,7 +513,7 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
         /* Each 'exec' stream gets its own profiling stream, except IN and OUT stream that share it.
          * It's good to separate the exec streams to know what was submitted to what stream
          * We don't have this issue for the IN and OUT streams because types of event discriminate
-         * what happens where, and separating them consumes memory and increases the number of 
+         * what happens where, and separating them consumes memory and increases the number of
          * events that needs to be matched between streams because we cannot differentiate some
          * ends between IN or OUT, so they are all logged on the same stream. */
         gpu_device->trackable_events = PARSEC_PROFILE_GPU_TRACK_EXEC | PARSEC_PROFILE_GPU_TRACK_DATA_OUT
@@ -567,9 +570,9 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
     /* Initialize internal lists */
     PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_lru,       parsec_list_t);
     PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_owned_lru, parsec_list_t);
-    PARSEC_OBJ_CONSTRUCT(&gpu_device->pending,           parsec_fifo_t);
+    PARSEC_OBJ_CONSTRUCT(&gpu_device->pending, parsec_lifo_t);
+    parsec_heap_init(&gpu_device->pending_heap, offsetof(parsec_gpu_task_t, priority));
 
-    gpu_device->sort_starting_p = NULL;
     gpu_device->peer_access_mask = 0;  /* No GPU to GPU direct transfer by default */
 
     device->memory_register      = parsec_cuda_memory_register;
@@ -641,7 +644,7 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
 #if defined(PARSEC_PROF_TRACE)
             if( NULL != exec_stream->profiling ) {
                 /* No function to clean the profiling stream. If one is introduced
-                 * some day, remember that exec streams 0 and 1 always share the same 
+                 * some day, remember that exec streams 0 and 1 always share the same
                  * ->profiling stream, and that all of them share the same
                  * ->profiling stream if parsec_device_cuda_one_profiling_stream_per_cuda_stream == 0 */
             }
@@ -671,8 +674,9 @@ parsec_cuda_module_fini(parsec_device_module_t* device)
     /* Release the registered memory */
     parsec_device_memory_release(gpu_device);
 
-    /* Release pending queue */
+    /* Release pending queue and heap */
     PARSEC_OBJ_DESTRUCT(&gpu_device->pending);
+    parsec_heap_fini(&gpu_device->pending_heap);
 
     /* Release all streams */
     for( j = 0; j < gpu_device->num_exec_streams; j++ ) {
