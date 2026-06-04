@@ -3,6 +3,7 @@
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
  * Copyright (c) 2024-2026 NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2026      Stony Brook University. All rights reserved.
  */
 
 /** @addtogroup parsec_device
@@ -118,12 +119,6 @@ typedef int   (*parsec_device_data_advise_f)(parsec_device_module_t*, parsec_dat
 typedef void* (*parsec_device_find_function_f)(parsec_device_module_t*, char*);
 
 /**
- * Reorders the list of pending tasks on the current device based on the
- *   current heuristic implemented by the device
- */
-typedef int  (*parsec_device_sort_pending_list_function_f)(parsec_device_module_t*);
-
-/**
  * Schedules some kernel represented by @p task on the device @p module,
  * from the execution stream @p es.
  * 
@@ -155,7 +150,6 @@ struct parsec_device_module_s {
     parsec_device_memory_release_f         memory_release;
     parsec_device_data_advise_f            data_advise;
     parsec_device_find_function_f          find_function;
-    parsec_device_sort_pending_list_function_f sort_pending_list;
     parsec_device_kernel_scheduler_function_t  kernel_scheduler;
     parsec_device_all_devices_attached_f   all_devices_attached;
 
