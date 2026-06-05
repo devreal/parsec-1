@@ -175,7 +175,7 @@ void parsec_matrix_block_cyclic_init(parsec_matrix_block_cyclic_t * dc,
         break;
     }
 
-    /* If rows or cols are 0, then no elemns, set
+    /* If rows or cols are 0, then no elements, set
      * both to 0.
      * */
     if(dc->nb_elem_r == 0) dc->nb_elem_c = 0;
@@ -302,7 +302,7 @@ static int32_t twoDBC_vpid_of(parsec_data_collection_t *desc, ...)
     dc = (parsec_matrix_block_cyclic_t *)desc;
 
     /* If 1 VP, always return 0 */
-    pq = vpmap_get_nb_vp();
+    pq = parsec_vpmap_get_nb_vp();
     if ( pq == 1 )
         return 0;
 
@@ -337,7 +337,7 @@ static int32_t twoDBC_vpid_of(parsec_data_collection_t *desc, ...)
     assert( (n % dc->grid.cols) == dc->grid.crank );
 
     vpid = (local_n % q) * p + (local_m % p);
-    assert( vpid < vpmap_get_nb_vp() );
+    assert( vpid < parsec_vpmap_get_nb_vp() );
     return vpid;
 }
 
@@ -393,7 +393,7 @@ static parsec_data_t* twoDBC_data_of(parsec_data_collection_t *desc, ...)
 
     position = twoDBC_coordinates_to_position(dc, m, n);
 
-    /* If mat allocatd, set pos to the right position for each tile */
+    /* If mat allocated, set pos to the right position for each tile */
     if( NULL != dc->mat ) {
         if( dc->super.storage == PARSEC_MATRIX_TILE ) {
             pos = position;
@@ -583,7 +583,7 @@ static int32_t twoDBC_kcyclic_vpid_of(parsec_data_collection_t *desc, ...)
     dc = (parsec_matrix_block_cyclic_t *)desc;
 
     /* If no vp, always return 0 */
-    pq = vpmap_get_nb_vp();
+    pq = parsec_vpmap_get_nb_vp();
     if ( pq == 1 )
         return 0;
 
@@ -619,7 +619,7 @@ static int32_t twoDBC_kcyclic_vpid_of(parsec_data_collection_t *desc, ...)
     local_n += n % dc->grid.kcols;
 
     vpid = (local_n % q) * p + (local_m % p);
-    assert( vpid < vpmap_get_nb_vp() );
+    assert( vpid < parsec_vpmap_get_nb_vp() );
     return vpid;
 }
 
@@ -667,7 +667,7 @@ static parsec_data_t* twoDBC_kcyclic_data_of(parsec_data_collection_t *desc, ...
 
     position = dc->nb_elem_r * local_n + local_m;;
 
-    /* If mat allocatd, set pos to the right position for each tile */
+    /* If mat allocated, set pos to the right position for each tile */
     if( NULL != dc->mat ) {
         if( dc->super.storage == PARSEC_MATRIX_TILE ) {
             pos = position;

@@ -2,7 +2,7 @@
  * Copyright (c) 2009-2024 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
- * Copyright (c) 2024      NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2024-2026 NVIDIA Corporation.  All rights reserved.
  */
 
 #include "parsec/parsec_config.h"
@@ -197,7 +197,7 @@ static int32_t vector_twoDBC_vpid_of(parsec_data_collection_t *desc, ...)
     dc = (parsec_vector_two_dim_cyclic_t *)desc;
 
     /* If 1 VP, always return 0 */
-    pq = vpmap_get_nb_vp();
+    pq = parsec_vpmap_get_nb_vp();
     if ( pq == 1 )
         return 0;
 
@@ -226,7 +226,7 @@ static int32_t vector_twoDBC_vpid_of(parsec_data_collection_t *desc, ...)
 
     vpid = local_m * q + local_n;
 
-    assert( vpid < vpmap_get_nb_vp() );
+    assert( vpid < parsec_vpmap_get_nb_vp() );
     return vpid;
 }
 
@@ -256,7 +256,7 @@ static parsec_data_t* vector_twoDBC_data_of(parsec_data_collection_t *desc, ...)
 
     local_m = m / dc->lcm;
 
-    /* If mat allocatd, set pos to the right position for each tile */
+    /* If mat allocated, set pos to the right position for each tile */
     if( NULL != dc->mat ) {
         pos = local_m * dc->super.mb;
         pos *= parsec_datadist_getsizeoftype(dc->super.mtype);

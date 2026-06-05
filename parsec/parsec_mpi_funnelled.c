@@ -2,6 +2,7 @@
  * Copyright (c) 2009-2023 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
+ * Copyright (c) 2026      NVIDIA Corporation.  All rights reserved.
  */
 
 #include <mpi.h>
@@ -17,6 +18,9 @@
 #include "parsec/execution_stream.h"
 #include "parsec/utils/debug.h"
 #include "parsec/utils/mca_param.h"
+#if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT)
+#include "parsec/mca/device/device_gpu.h"
+#endif  /* defined(PARSEC_HAVE_DEV_CUDA_SUPPORT) */
 
 #ifdef ENABLE_DEBUG
 #define DEBUG(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
@@ -124,14 +128,23 @@ static parsec_atomic_lock_t parsec_ce_am_build_lock = PARSEC_ATOMIC_UNLOCKED;
 static int mpi_funnelled_tag_unregister_unsafe_internal(parsec_ce_tag_t tag);
 
 /* Range of index allowed for each type of request.
- * For registered tags, each will get EACH_STATIC_REQ_RANGE spots in the array of requests.
- * For dynamic tags, there will be a total of MAX_DYNAMIC_REQ_RANGE
- * spots in the request array.
+ * For registered tags, each gets a tested window in array_of_requests,
+ * backed by a larger pool of posted persistent receives owned by the tag.
+ * Dynamic requests use the remaining slots in array_of_requests.
  */
 #define MAX_DYNAMIC_REQ_RANGE 30 /* according to current implementation */
 #define MAX_NUM_RECV_REQ_IN_ARRAY 15
 #define EACH_STATIC_REQ_RANGE 512 /* for each registered tag */
 #define MAX_NUM_SEND_REQ_IN_ARRAY 15
+
+#define MPI_FUNNELLED_AM_POSTED_DEFAULT      (2 * DEP_NB_CONCURRENT)
+#define MPI_FUNNELLED_DYNAMIC_REQ_DEFAULT    30
+#define MPI_FUNNELLED_DYNAMIC_RECV_DEFAULT   15
+
+static int parsec_param_comm_mpi_am_posted_requests = MPI_FUNNELLED_AM_POSTED_DEFAULT;
+static int parsec_param_comm_mpi_am_tested_requests = 0;
+static int parsec_param_comm_mpi_dynamic_requests = MPI_FUNNELLED_DYNAMIC_REQ_DEFAULT;
+static int parsec_param_comm_mpi_dynamic_recv_requests = MPI_FUNNELLED_DYNAMIC_RECV_DEFAULT;
 
 typedef enum parsec_ce_tag_status_e {
     PARSEC_CE_TAG_STATUS_INACTIVE = 1,
@@ -145,6 +158,9 @@ typedef struct mpi_funnelled_tag_s {
     int16_t start_idx; /* Records the starting index for every TAG
                         * to unregister from the array_of_[requests/indices/statuses]
                         */
+    int req_count; /* Number of posted persistent receives owned by this AM tag. */
+    int tested_count; /* Number of this tag's posted requests present in MPI_Testsome. */
+    int req_idx; /* Next request from the posted pool to move into the tested window. */
     parsec_ce_tag_status_t status;  /* The current status of this tag (inactive/active, enable/disable) */
     size_t  msg_length; /* Maximum length allowed to send for this TAG */
     parsec_ce_am_callback_t callback;  /* callback to call upon reception of the
@@ -155,6 +171,8 @@ typedef struct mpi_funnelled_tag_s {
                                * the msg_length. It is better if the msg_length is a multiple of the
                                * cache lines size.
                                */
+    MPI_Request *reqs; /* All posted persistent receive requests for this tag. */
+    bool *reqs_in_testsome; /* Tracks which posted receives are in the tested window. */
 } mpi_funnelled_tag_t;
 
 static struct mpi_funnelled_tag_s parsec_mpi_funnelled_array_of_registered_tags[PARSEC_MAX_REGISTERED_TAGS];
@@ -186,6 +204,8 @@ typedef struct mpi_funnelled_callback_s {
     bool is_dynamic_recv;
     bool is_dynamic_send;
     bool free_cb_data;
+    int storage1; /* index of this callback in the tested window (array_of_requests) */
+    int storage2; /* per-tag pool index of the associated persistent receive request */
 
     union {
         /* MPI_FUNNELLED_TYPE_AM */
@@ -227,8 +247,7 @@ static MPI_Comm parsec_ce_mpi_comm = MPI_COMM_NULL;     /* Data moving communica
 /* The internal communicator for all intra-node communications */
 static MPI_Comm parsec_ce_mpi_self_comm = MPI_COMM_NULL;
 
-static mpi_funnelled_callback_t **array_of_callbacks;
-static mpi_funnelled_callback_t *array_of_callback_objects = NULL; // empty until register a tag
+static mpi_funnelled_callback_t *array_of_callbacks;
 static MPI_Request              *array_of_requests;
 static pthread_mutex_t           array_of_requests_mtx;
 static int                      *array_of_indices;
@@ -238,6 +257,7 @@ static MPI_Status               *array_of_statuses;
 static int size_of_total_reqs = 0;
 /** The current size of the arrays of requests. */
 static int current_size_of_total_reqs = 0;
+static int mpi_funnelled_static_req_idx = 0;
 static int mpi_funnelled_last_active_req = 0;
 static _Atomic int mpi_funnelled_num_recv_req_in_arr = 0;
 static _Atomic int mpi_funnelled_num_send_req_in_arr = 0;
@@ -253,6 +273,8 @@ static parsec_list_t mpi_funnelled_dynamic_sendreq_fifo; /* ordered non threaded
 static parsec_list_t mpi_funnelled_dynamic_sendamreq_fifo; /* ordered non threaded fifo */
 static parsec_list_t mpi_funnelled_dynamic_recvreq_fifo; /* ordered non threaded fifo */
 static parsec_mempool_t *mpi_funnelled_dynamic_req_mempool = NULL;
+
+int parsec_mpi_allow_gpu_memory_communications = 3;
 
 /* This structure is used to save all the information necessary to
  * invoke a callback after a MPI_Request is satisfied
@@ -294,11 +316,74 @@ mpi_no_thread_send_active_message_impl(parsec_comm_engine_t *ce,
                                   void *header, size_t header_size,
                                   void *payload, size_t payload_size);
 
-
 /* Common function to serve callbacks of completed request */
 static int
 mpi_no_thread_serve_cb(parsec_comm_engine_t *ce, mpi_funnelled_callback_t *cb,
                        int mpi_tag, int mpi_source, int length, void *buf, bool restart_am);
+
+static void mpi_funnelled_normalize_params(void)
+{
+    if( parsec_param_comm_mpi_am_posted_requests <= 0 ) {
+        parsec_param_comm_mpi_am_posted_requests = MPI_FUNNELLED_AM_POSTED_DEFAULT;
+    }
+    if( parsec_param_comm_mpi_am_tested_requests <= 0 ) {
+        parsec_param_comm_mpi_am_tested_requests = parsec_param_comm_mpi_am_posted_requests / 4;
+        if( parsec_param_comm_mpi_am_tested_requests <= 0 ) {
+            parsec_param_comm_mpi_am_tested_requests = 1;
+        }
+    }
+    if( parsec_param_comm_mpi_am_tested_requests > parsec_param_comm_mpi_am_posted_requests ) {
+        parsec_warning("runtime_comm_mpi_am_tested_requests (%d) is larger than runtime_comm_mpi_am_posted_requests (%d); capping it.",
+                       parsec_param_comm_mpi_am_tested_requests, parsec_param_comm_mpi_am_posted_requests);
+        parsec_param_comm_mpi_am_tested_requests = parsec_param_comm_mpi_am_posted_requests;
+    }
+
+    if( parsec_param_comm_mpi_dynamic_requests <= 0 ) {
+        parsec_param_comm_mpi_dynamic_requests = MPI_FUNNELLED_DYNAMIC_REQ_DEFAULT;
+    }
+    if( parsec_param_comm_mpi_dynamic_recv_requests <= 0 ) {
+        parsec_param_comm_mpi_dynamic_recv_requests = parsec_param_comm_mpi_dynamic_requests / 2;
+        if( parsec_param_comm_mpi_dynamic_recv_requests <= 0 ) {
+            parsec_param_comm_mpi_dynamic_recv_requests = 1;
+        }
+    }
+    if( parsec_param_comm_mpi_dynamic_recv_requests > parsec_param_comm_mpi_dynamic_requests ) {
+        parsec_warning("runtime_comm_mpi_dynamic_recv_requests (%d) is larger than runtime_comm_mpi_dynamic_requests (%d); capping it.",
+                       parsec_param_comm_mpi_dynamic_recv_requests, parsec_param_comm_mpi_dynamic_requests);
+        parsec_param_comm_mpi_dynamic_recv_requests = parsec_param_comm_mpi_dynamic_requests;
+    }
+}
+
+static int
+mpi_funnelled_can_post_dynamic_recv(void)
+{
+    return (mpi_funnelled_last_active_req < current_size_of_total_reqs) &&
+           (mpi_funnelled_num_recv_req_in_arr < parsec_param_comm_mpi_dynamic_recv_requests);
+}
+
+static void
+mpi_funnelled_append_dynamic_request(mpi_funnelled_dynamic_req_t *item)
+{
+    int slot = mpi_funnelled_last_active_req;
+
+    assert(slot >= mpi_funnelled_static_req_idx);
+    assert(slot < current_size_of_total_reqs);
+
+    array_of_callbacks[slot] = item->cb;
+    array_of_callbacks[slot].storage1 = slot;
+
+    if(item->post_isend) {
+        mpi_funnelled_mem_reg_handle_t *ldata = (mpi_funnelled_mem_reg_handle_t *) item->cb.onesided.lreg;
+        MPI_Isend((char *)ldata->mem + item->cb.onesided.ldispl, ldata->count,
+                  ldata->datatype, item->cb.onesided.remote, item->cb.onesided.tag, parsec_ce_mpi_comm,
+                  &array_of_requests[slot]);
+    } else {
+        array_of_requests[slot] = item->request;
+        item->request = MPI_REQUEST_NULL;
+    }
+
+    mpi_funnelled_last_active_req++;
+}
 
 /* Data we pass internally inside GET and PUT for handshake and other
  * synchronizations.
@@ -710,8 +795,36 @@ static int mpi_funneled_init_once(parsec_context_t* context)
                                             &parsec_mpi_start_start_key, &parsec_mpi_start_end_key);
 #endif // PARSEC_PROF_TRACE
 
-    /* TODO: fork off work threads */
+    parsec_mca_param_reg_int_name("runtime", "comm_mpi_am_posted_requests",
+                                  "Maximum number of persistent receive requests posted for each active-message tag. "
+                                  "Only a smaller tested window is kept in MPI_Testsome; set to 0 for the runtime default.",
+                                  false, false, parsec_param_comm_mpi_am_posted_requests,
+                                  &parsec_param_comm_mpi_am_posted_requests);
+    parsec_mca_param_reg_int_name("runtime", "comm_mpi_am_tested_requests",
+                                  "Number of active-message requests per tag kept in MPI_Testsome during progress. "
+                                  "This should be no larger than comm_mpi_am_posted_requests; set to 0 for a runtime-selected value.",
+                                  false, false, parsec_param_comm_mpi_am_tested_requests,
+                                  &parsec_param_comm_mpi_am_tested_requests);
+    parsec_mca_param_reg_int_name("runtime", "comm_mpi_dynamic_requests",
+                                  "Maximum number of dynamic MPI communication requests, such as data GET and PUT operations, "
+                                  "kept in MPI_Testsome.",
+                                  false, false, parsec_param_comm_mpi_dynamic_requests,
+                                  &parsec_param_comm_mpi_dynamic_requests);
+    parsec_mca_param_reg_int_name("runtime", "comm_mpi_dynamic_recv_requests",
+                                  "Maximum number of dynamic receive requests kept in MPI_Testsome. "
+                                  "This value is capped by comm_mpi_dynamic_requests.",
+                                  false, false, parsec_param_comm_mpi_dynamic_recv_requests,
+                                  &parsec_param_comm_mpi_dynamic_recv_requests);
+    mpi_funnelled_normalize_params();
 
+#if !defined(PARSEC_MPI_IS_GPU_AWARE)
+    parsec_mpi_allow_gpu_memory_communications = 0;
+#endif
+    parsec_mca_param_reg_int_name("mpi", "gpu_aware",
+                                  "Enabled if PaRSEC should allow MPI to move data directly from or to GPU memory. Otherwise, all data"
+                                  " movements will transit through CPU memory, and will always have a backup copy there. Accepted values "
+                                  "are ORed between 1 for receiving into GPU memory and 2 for sending from GPU memory",
+                                  false, false, parsec_mpi_allow_gpu_memory_communications, &parsec_mpi_allow_gpu_memory_communications);
     (void)context;
     return 0;
 }
@@ -735,9 +848,15 @@ mpi_funnelled_init(parsec_context_t *context)
         parsec_mpi_funnelled_array_of_registered_tags[i].am_backend_memory = NULL;
         parsec_mpi_funnelled_array_of_registered_tags[i].callback = NULL;
         parsec_mpi_funnelled_array_of_registered_tags[i].status = PARSEC_CE_TAG_STATUS_INACTIVE;
+        parsec_mpi_funnelled_array_of_registered_tags[i].start_idx = -1;
+        parsec_mpi_funnelled_array_of_registered_tags[i].req_count = 0;
+        parsec_mpi_funnelled_array_of_registered_tags[i].tested_count = 0;
+        parsec_mpi_funnelled_array_of_registered_tags[i].req_idx = 0;
+        parsec_mpi_funnelled_array_of_registered_tags[i].reqs = NULL;
+        parsec_mpi_funnelled_array_of_registered_tags[i].reqs_in_testsome = NULL;
     }
 
-    size_of_total_reqs = MAX_DYNAMIC_REQ_RANGE;
+    size_of_total_reqs = parsec_param_comm_mpi_dynamic_requests;
 
      /* Make all the fn pointers point to this component's function */
     parsec_ce.enable              = mpi_no_thread_enable;
@@ -826,7 +945,6 @@ mpi_funnelled_fini(parsec_comm_engine_t *ce)
     parsec_atomic_unlock(&parsec_ce_am_build_lock);
 
     free(array_of_callbacks); array_of_callbacks = NULL;
-    free(array_of_callback_objects); array_of_callback_objects = NULL;
     free(array_of_requests);  array_of_requests  = NULL;
     free(array_of_indices);   array_of_indices   = NULL;
     free(array_of_statuses);  array_of_statuses  = NULL;
@@ -860,6 +978,7 @@ mpi_funnelled_fini(parsec_comm_engine_t *ce)
     MAX_MPI_TAG = -1;  /* mark the layer as uninitialized */
     size_of_total_reqs = 0;
     mpi_funnelled_last_active_req = 0;
+    mpi_funnelled_static_req_idx = 0;
 
     PARSEC_OBJ_DESTRUCT(&worklist);
 
@@ -898,20 +1017,42 @@ mpi_no_thread_tag_register(parsec_ce_tag_t tag,
     tag_struct->msg_length = (msg_length + 15) & ~0xF;  /* align to 16 bytes */
     tag_struct->callback = callback;
     tag_struct->cb_data = cb_data;
+    tag_struct->req_count = parsec_param_comm_mpi_am_posted_requests;
+    tag_struct->tested_count = parsec_param_comm_mpi_am_tested_requests;
+    tag_struct->req_idx = 0;
     tag_struct->status = PARSEC_CE_TAG_STATUS_ENABLE;
 
     /* Update the total number of requests we know about */
-    size_of_total_reqs += EACH_STATIC_REQ_RANGE;
+    size_of_total_reqs += tag_struct->tested_count;
     /* Make sure the AM infrastructure is rebuilt at the next progress cycle */
     parsec_ce_am_design_version++;
     parsec_atomic_unlock(&parsec_ce_am_build_lock);
     return PARSEC_SUCCESS;
 }
 
+static void
+mpi_funnelled_set_am_request_slot(mpi_funnelled_callback_t *callbacks,
+                                  MPI_Request *requests,
+                                  int slot,
+                                  mpi_funnelled_tag_t *tag_struct,
+                                  int req_idx)
+{
+    mpi_funnelled_callback_t *cb = &callbacks[slot];
+
+    assert(!tag_struct->reqs_in_testsome[req_idx]);
+    requests[slot] = tag_struct->reqs[req_idx];
+    tag_struct->reqs_in_testsome[req_idx] = true;
+    cb->cb_type.am.fct = tag_struct->callback;
+    cb->cb_data        = tag_struct->cb_data;
+    cb->storage1       = slot;
+    cb->storage2       = req_idx;
+    cb->tag_reg        = tag_struct;
+    cb->type           = MPI_FUNNELLED_TYPE_AM;
+    cb->is_dynamic_recv = false;
+}
+
 static int parsec_ce_rebuild_am_requests(void)
 {
-    mpi_funnelled_callback_t* cb;
-
     if(parsec_ce_am_build_version == parsec_ce_am_design_version) {
         /* There is nothing to update, the engine is ready to rock */
         return PARSEC_SUCCESS;
@@ -924,9 +1065,11 @@ static int parsec_ce_rebuild_am_requests(void)
      */
     array_of_indices = realloc(array_of_indices, size_of_total_reqs * sizeof(int));
     array_of_statuses = realloc(array_of_statuses, size_of_total_reqs * sizeof(MPI_Status));
-    mpi_funnelled_callback_t *tmp_array_cb_objs = malloc(sizeof(mpi_funnelled_callback_t) * size_of_total_reqs);
-    mpi_funnelled_callback_t **tmp_array_cb = malloc(sizeof(mpi_funnelled_callback_t*)*size_of_total_reqs);
+    mpi_funnelled_callback_t *tmp_array_cb = calloc(size_of_total_reqs, sizeof(mpi_funnelled_callback_t));
     MPI_Request *tmp_array_req = malloc(sizeof(MPI_Request) * size_of_total_reqs);
+    for( int i = 0; i < size_of_total_reqs; i++ ) {
+        tmp_array_req[i] = MPI_REQUEST_NULL;
+    }
 
     int idx = 0, old_idx = 0;
     for( int tag = 0; tag < PARSEC_MAX_REGISTERED_TAGS; tag++ ) {
@@ -935,69 +1078,60 @@ static int parsec_ce_rebuild_am_requests(void)
             (tag_struct->status == PARSEC_CE_TAG_STATUS_INACTIVE) )  /* No changes for this tag */
             continue;
         if( tag_struct->status == PARSEC_CE_TAG_STATUS_DISABLE ) {
+            old_idx += tag_struct->tested_count;
             mpi_funnelled_tag_unregister_unsafe_internal(tag);
-            old_idx += EACH_STATIC_REQ_RANGE;
             continue;
         }
         if( tag_struct->status == PARSEC_CE_TAG_STATUS_ACTIVE ) {
-            memcpy(&tmp_array_cb_objs[idx], &array_of_callback_objects[old_idx],
-                   sizeof(mpi_funnelled_callback_t) * EACH_STATIC_REQ_RANGE);
-            /* rebuild callback struct pointers */
-            for (int i = 0; i < EACH_STATIC_REQ_RANGE; ++i) {
-                tmp_array_cb[idx+i] = &tmp_array_cb_objs[idx+i];
-            }
+            memcpy(&tmp_array_cb[idx], &array_of_callbacks[old_idx],
+                   sizeof(mpi_funnelled_callback_t) * tag_struct->tested_count);
             memcpy(&tmp_array_req[idx], &array_of_requests[old_idx],
-                   sizeof(MPI_Request) * EACH_STATIC_REQ_RANGE);
-            idx     += EACH_STATIC_REQ_RANGE;
-            old_idx += EACH_STATIC_REQ_RANGE;
+                   sizeof(MPI_Request) * tag_struct->tested_count);
+            tag_struct->start_idx = idx;
+            for( int i = 0; i < tag_struct->tested_count; i++ ) {
+                tmp_array_cb[idx + i].storage1 = idx + i;
+            }
+            idx     += tag_struct->tested_count;
+            old_idx += tag_struct->tested_count;
             continue;
         }
         assert(PARSEC_CE_TAG_STATUS_ENABLE == tag_struct->status);
 
-        char *buf = (char *) calloc(EACH_STATIC_REQ_RANGE, tag_struct->msg_length * sizeof(char));
+        char *buf = (char *) calloc(tag_struct->req_count, tag_struct->msg_length * sizeof(char));
 
         tag_struct->am_backend_memory = buf;
+        tag_struct->reqs = (MPI_Request *) calloc(tag_struct->req_count, sizeof(MPI_Request));
+        tag_struct->reqs_in_testsome = (bool *) calloc(tag_struct->req_count, sizeof(bool));
         tag_struct->start_idx  = idx;
         tag_struct->status = PARSEC_CE_TAG_STATUS_ACTIVE;
 
-        for(int i = 0; i < EACH_STATIC_REQ_RANGE; i++) {
+        for(int i = 0; i < tag_struct->req_count; i++) {
             buf = tag_struct->am_backend_memory + i * tag_struct->msg_length * sizeof(char);
 
-            /* Even though the address of array_of_requests changes after every
-             * new registration of tags, the initialization of the requests will
-             * still work as the memory is copied after initialization.
-             */
             MPI_Recv_init(buf, tag_struct->msg_length, MPI_BYTE,
                           MPI_ANY_SOURCE, tag, parsec_ce_mpi_am_comm[tag],
-                          &tmp_array_req[idx]);
+                          &tag_struct->reqs[i]);
+        }
+        /* Tag ready to receive data, start all persistent receives. */
+        MPI_Startall(tag_struct->req_count, tag_struct->reqs);
 
-            cb = tmp_array_cb[idx] = &tmp_array_cb_objs[idx];
-            cb->cb_type.am.fct = tag_struct->callback;
-            cb->cb_data        = tag_struct->cb_data;
-            cb->dynamic_req    = NULL;
-            cb->cb_type.am.idx = idx;
-            cb->cb_type.am.reqid = i;
-            cb->tag_reg        = tag_struct;
-            cb->type           = MPI_FUNNELLED_TYPE_AM;
-            cb->is_dynamic_recv = false;
-            cb->is_dynamic_send = false;
+        for(int i = 0; i < tag_struct->tested_count; i++) {
+            mpi_funnelled_set_am_request_slot(tmp_array_cb, tmp_array_req, idx, tag_struct, i);
             idx++;
         }
-        /* Tag ready to receive data, start all persistent receives */
-        MPI_Startall(EACH_STATIC_REQ_RANGE, &tmp_array_req[idx - EACH_STATIC_REQ_RANGE]);
+        tag_struct->req_idx = tag_struct->tested_count % tag_struct->req_count;
     }
+    mpi_funnelled_static_req_idx = idx;
     /* Replace the arrays of callbacks and requests with the newly populated ones */
     free(array_of_callbacks);
-    free(array_of_callback_objects);
     array_of_callbacks = tmp_array_cb;
-    array_of_callback_objects = tmp_array_cb_objs;
     free(array_of_requests);
     array_of_requests = tmp_array_req;
 
     mpi_funnelled_last_active_req = idx;
 
     current_size_of_total_reqs = size_of_total_reqs;
-    assert((idx + MAX_DYNAMIC_REQ_RANGE) == current_size_of_total_reqs);
+    assert((idx + parsec_param_comm_mpi_dynamic_requests) == current_size_of_total_reqs);
     parsec_atomic_unlock(&parsec_ce_am_build_lock);
     return PARSEC_SUCCESS;
 }
@@ -1012,21 +1146,28 @@ mpi_funnelled_tag_unregister_unsafe_internal(parsec_ce_tag_t tag)
         (PARSEC_CE_TAG_STATUS_DISABLE == tag_struct->status) ) {
         MPI_Status status;
 
-        for(int flag, i = tag_struct->start_idx; i < tag_struct->start_idx + EACH_STATIC_REQ_RANGE; i++) {
+        for(int flag, i = 0; i < tag_struct->req_count; i++) {
 #if !defined(CRAY_MPICH_VERSION)
             // MPI Cancel broken on Cray
-            MPI_Cancel(&array_of_requests[i]);
-            MPI_Test(&array_of_requests[i], &flag, &status);
+            MPI_Cancel(&tag_struct->reqs[i]);
+            MPI_Test(&tag_struct->reqs[i], &flag, &status);
 #endif
-            MPI_Request_free(&array_of_requests[i]);
-            assert( MPI_REQUEST_NULL == array_of_requests[i] );
+            MPI_Request_free(&tag_struct->reqs[i]);
+            assert( MPI_REQUEST_NULL == tag_struct->reqs[i] );
         }
+        free(tag_struct->reqs);
+        tag_struct->reqs = NULL;
+        free(tag_struct->reqs_in_testsome);
+        tag_struct->reqs_in_testsome = NULL;
         free(tag_struct->am_backend_memory);
         tag_struct->am_backend_memory = NULL;
     }
     tag_struct->callback = NULL;
     tag_struct->cb_data = NULL;
     tag_struct->start_idx = -1;
+    tag_struct->req_count = 0;
+    tag_struct->tested_count = 0;
+    tag_struct->req_idx = 0;
     tag_struct->status = PARSEC_CE_TAG_STATUS_INACTIVE;
 
     return PARSEC_SUCCESS;
@@ -1046,10 +1187,18 @@ mpi_no_thread_tag_unregister(parsec_ce_tag_t tag)
     parsec_atomic_lock(&parsec_ce_am_build_lock);
     if( PARSEC_CE_TAG_STATUS_ENABLE == tag_struct->status ) {
         /* requests not yet create, change the status and return */
+        size_of_total_reqs -= tag_struct->tested_count;
+        tag_struct->callback = NULL;
+        tag_struct->cb_data = NULL;
+        tag_struct->req_count = 0;
+        tag_struct->tested_count = 0;
+        tag_struct->req_idx = 0;
+        tag_struct->reqs_in_testsome = NULL;
         tag_struct->status = PARSEC_CE_TAG_STATUS_INACTIVE;
         parsec_atomic_unlock(&parsec_ce_am_build_lock);
         return PARSEC_SUCCESS;
     }
+    size_of_total_reqs -= tag_struct->tested_count;
     tag_struct->status = PARSEC_CE_TAG_STATUS_DISABLE;
     /* if the engine is active, notify it to rebuild the arrays of requests at the next cycle */
     parsec_ce_am_design_version++;
@@ -1353,10 +1502,15 @@ mpi_no_thread_serve_cb(parsec_comm_engine_t *ce, mpi_funnelled_callback_t *cb,
             ret = cb->cb_type.am.fct(ce, mpi_tag, buf, length,
                                      mpi_source, cb->cb_data);
         }
-        /* this is a persistent request, let's restart it (if not already done) */
+        /* Restart the completed persistent receive for future use.
+         * Nullify the tested-window slot; mpi_funnelled_refill_am_requests
+         * will rotate it back into the window when needed.
+         */
         if (restart_am) {
             TRACE(parsec_mpi_start_start_key);
-            MPI_Start(&array_of_requests[cb->cb_type.am.idx]);
+            MPI_Start(&cb->tag_reg->reqs[cb->storage2]);
+            cb->tag_reg->reqs_in_testsome[cb->storage2] = false;
+            array_of_requests[cb->storage1] = MPI_REQUEST_NULL;
             TRACE(parsec_mpi_start_end_key);
         }
     } else if(cb->type == MPI_FUNNELLED_TYPE_ONESIDED) {
@@ -1391,6 +1545,56 @@ mpi_no_thread_serve_cb(parsec_comm_engine_t *ce, mpi_funnelled_callback_t *cb,
     return ret;
 }
 
+static void
+mpi_funnelled_refill_am_requests(void)
+{
+    for( int tag = 0; tag < PARSEC_MAX_REGISTERED_TAGS; tag++ ) {
+        mpi_funnelled_tag_t *tag_struct = &parsec_mpi_funnelled_array_of_registered_tags[tag];
+        int start, end, write;
+
+        if( PARSEC_CE_TAG_STATUS_ACTIVE != tag_struct->status ) {
+            continue;
+        }
+
+        start = tag_struct->start_idx;
+        end = start + tag_struct->tested_count;
+        write = start;
+
+        /* Keep the tested AM windows packed, preserving the order of the
+         * requests still present in MPI_Testsome.
+         */
+        for( int read = start; read < end; read++ ) {
+            if( MPI_REQUEST_NULL == array_of_requests[read] ) {
+                continue;
+            }
+            if( write != read ) {
+                array_of_requests[write] = array_of_requests[read];
+                array_of_callbacks[write] = array_of_callbacks[read];
+                array_of_callbacks[write].storage1 = write;
+                array_of_requests[read] = MPI_REQUEST_NULL;
+            }
+            write++;
+        }
+
+        /* Refill the empty tail with already-posted receives from the tag's
+         * private pool. These receives were active all along; moving only a
+         * small window into MPI_Testsome keeps progress scans bounded.
+         */
+        for( ; write < end; write++ ) {
+            for( int i = 0; i < tag_struct->req_count; i++ ) {
+                if( !tag_struct->reqs_in_testsome[tag_struct->req_idx] ) {
+                    break;
+                }
+                tag_struct->req_idx = (tag_struct->req_idx + 1) % tag_struct->req_count;
+            }
+            assert(!tag_struct->reqs_in_testsome[tag_struct->req_idx]);
+            mpi_funnelled_set_am_request_slot(array_of_callbacks, array_of_requests,
+                                              write, tag_struct, tag_struct->req_idx);
+            tag_struct->req_idx = (tag_struct->req_idx + 1) % tag_struct->req_count;
+        }
+    }
+}
+
 static int
 mpi_no_thread_push_posted_req(parsec_comm_engine_t *ce)
 {
@@ -1399,12 +1603,12 @@ mpi_no_thread_push_posted_req(parsec_comm_engine_t *ce)
     pthread_mutex_lock(&array_of_requests_mtx);
 
     /* make sure no one has allocated the slot before we took the lock */
-    if (mpi_funnelled_last_active_req >= size_of_total_reqs) {
+    if (mpi_funnelled_last_active_req >= current_size_of_total_reqs) {
         pthread_mutex_unlock(&array_of_requests_mtx);
         return 0;
     }
 
-    while (mpi_funnelled_last_active_req < size_of_total_reqs) {
+    while (mpi_funnelled_last_active_req < current_size_of_total_reqs) {
 
         mpi_funnelled_dynamic_req_t *item = NULL;
         if (MAX_NUM_RECV_REQ_IN_ARRAY > mpi_funnelled_num_recv_req_in_arr) {
@@ -1452,23 +1656,20 @@ mpi_no_thread_push_posted_req(parsec_comm_engine_t *ce)
                 dtype = ldata->datatype;
                 type = "ONESIDED";
             }
-            (void)type; // avoid unused variable warning
+            (void)type;
             TRACE_SENDRECV_INFO(parsec_mpi_isend_start_key, tag, count, remote);
             MPI_Isend(ptr, count, dtype, remote, tag, comm, &item->request);
             DEBUG("PUSH SEND %s to %d tag %d size %d pos %d req %p\n", type, remote, tag, count, pos, item->request);
-            //MPI_Isend((char *)ldata->mem + item->cb.onesided.ldispl, ldata->count,
-            //          ldata->datatype, item->cb.onesided.remote, item->cb.onesided.tag, parsec_ce_mpi_comm,
-            //          &item->request);
             TRACE(parsec_mpi_isend_end_key);
             pthread_mutex_lock(&array_of_requests_mtx);
         } else {
             DEBUG("PUSH %s proc %d tag %d size %zu pos %d req %p\n", (item->cb.is_dynamic_send) ? "SEND" : "RECV", item->cb.onesided.remote, item->cb.onesided.tag, item->cb.onesided.size, pos, item->request);
-		}
+        }
 
         assert(item->request != MPI_REQUEST_NULL);
         array_of_requests[pos] = item->request;
-        //item->request = MPI_REQUEST_NULL;
-        array_of_callbacks[pos] = &item->cb;
+        array_of_callbacks[pos] = item->cb;
+        array_of_callbacks[pos].storage1 = pos;
 
         /* only return the item if we don't need to keep it */
         if (NULL == item->cb.dynamic_req) {
@@ -1488,6 +1689,7 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
     int ret = 0, idx, outcount, pos;
     mpi_funnelled_callback_t *cb;
     int length;
+    void *buf;
 
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -1509,11 +1711,16 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
         /* Trigger the callbacks */
         for( idx = 0; idx < outcount; idx++ ) {
             pos = array_of_indices[idx];
-            cb = array_of_callbacks[pos];
+            cb = &array_of_callbacks[pos];
+            if (cb->is_dynamic_recv) {
+                mpi_funnelled_num_recv_req_in_arr--;
+            }
             status = &(array_of_statuses[idx]);
 
             MPI_Get_count(status, MPI_PACKED, &length);
-
+            cb->storage1 = pos;
+            buf = (MPI_FUNNELLED_TYPE_AM == cb->type) ?
+                  (cb->tag_reg->am_backend_memory + cb->tag_reg->msg_length * cb->storage2) : NULL;
 
 
             int tag = status->MPI_TAG;
@@ -1531,19 +1738,14 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
             } else if (cb->is_dynamic_send) {
                 type = "RECV";
             }
-            (void)type; // avoid unused variable warning
+            (void)type;
             assert(tag >= 0 && proc >= 0);
             DEBUG("COMPLETE %s rank %d proc %d tag %d\n", type, rank, proc, tag);
-            if (cb->is_dynamic_recv) {
-                int cnt = --mpi_funnelled_num_recv_req_in_arr;
-                DEBUG("COMPLETE DYNAMIC RECV cnt %d\n", cnt);
-                assert(cnt >= 0);
-            } else if (cb->type == MPI_FUNNELLED_TYPE_ONESIDED_MIMIC_AM) {
+            if (cb->type == MPI_FUNNELLED_TYPE_ONESIDED_MIMIC_AM) {
                 int cnt = --mpi_funnelled_num_send_req_in_arr;
                 DEBUG("COMPLETE MIMIC AM cnt %d\n", cnt);
                 assert(cnt >= 0);
             }
-
 
             if (num_workers > 0) {
                 if (NULL == cb->dynamic_req) {
@@ -1556,7 +1758,7 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
                     item->cb = *cb; /* copy the callback */
 
                     if(cb->type == MPI_FUNNELLED_TYPE_AM) {
-                        // copy out the data so we can restart the AM request
+                        /* copy out the data so we can restart the AM request */
                         if (length < DYNAMIC_REQ_PAYLOAD_SIZE) {
                             item->cb.cb_data = (void*)((intptr_t)item)+DYNAMIC_REQ_PAYLOAD_OFFSET;
                             item->cb.free_cb_data = false;
@@ -1564,15 +1766,16 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
                             item->cb.cb_data = malloc(length);
                             item->cb.free_cb_data = true;
                         }
-                        memcpy(item->cb.cb_data, (cb->tag_reg->am_backend_memory + cb->tag_reg->msg_length * cb->cb_type.am.reqid), length);
+                        memcpy(item->cb.cb_data, (cb->tag_reg->am_backend_memory + cb->tag_reg->msg_length * cb->storage2), length);
 
                         TRACE(parsec_mpi_start_start_key);
-                        MPI_Start(&array_of_requests[cb->cb_type.am.idx]);
+                        MPI_Start(&cb->tag_reg->reqs[cb->storage2]);
+                        cb->tag_reg->reqs_in_testsome[cb->storage2] = false;
+                        array_of_requests[cb->storage1] = MPI_REQUEST_NULL;
                         TRACE(parsec_mpi_start_end_key);
                     }
                 } else {
                     /* we have an item already, reuse it */
-                    assert(cb->dynamic_req != NULL);
                     item = cb->dynamic_req;
                 }
                 if (NULL == ring) {
@@ -1583,18 +1786,19 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
                 }
 
             } else {
-                /* Serve the callback and comeback */
+                /* Serve the callback directly (no worker threads) */
                 mpi_no_thread_serve_cb(ce, cb, status->MPI_TAG,
                                        status->MPI_SOURCE, length,
-                                       MPI_FUNNELLED_TYPE_AM == cb->type ? (cb->tag_reg->am_backend_memory + cb->tag_reg->msg_length * cb->cb_type.am.reqid) : NULL,
+                                       MPI_FUNNELLED_TYPE_AM == cb->type ? (cb->tag_reg->am_backend_memory + cb->tag_reg->msg_length * cb->storage2) : NULL,
                                        true);
-                /* return the dynamic req if necessary  */
                 if (NULL != cb->dynamic_req) {
                     release_dynamic_req(cb->dynamic_req);
                 }
             }
             ret++;
         }
+
+        mpi_funnelled_refill_am_requests();
 
         if (NULL != ring) {
             /* thread-shift the work */
@@ -1604,6 +1808,9 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
         pthread_mutex_lock(&array_of_requests_mtx);
         for( idx = outcount-1; idx >= 0; idx-- ) {
             pos = array_of_indices[idx];
+            if( pos < mpi_funnelled_static_req_idx ) {
+                continue;
+            }
             if(MPI_REQUEST_NULL != array_of_requests[pos])
                 continue;  /* The callback replaced the completed request, keep going */
 
@@ -1613,6 +1820,7 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
                 DEBUG("SWAP pos %d with last active %d req %p\n", pos, mpi_funnelled_last_active_req, array_of_requests[mpi_funnelled_last_active_req]);
                 array_of_requests[pos]  = array_of_requests[mpi_funnelled_last_active_req];
                 array_of_callbacks[pos] = array_of_callbacks[mpi_funnelled_last_active_req];
+                array_of_callbacks[pos].storage1 = pos;
             }
             array_of_requests[mpi_funnelled_last_active_req] = MPI_REQUEST_NULL;
         }
@@ -1640,7 +1848,7 @@ static int
 parsec_check_overlapping_binding(parsec_context_t *context)
 {
 #if defined(DISTRIBUTED) && defined(PARSEC_HAVE_MPI) && defined(PARSEC_HAVE_HWLOC) && defined(PARSEC_HAVE_HWLOC_BITMAP)
-    if( context->nb_nodes <= parsec_slow_bind_warning ) {
+    if( context->nb_nodes <= parsec_report_binding_issues ) {
         MPI_Comm comml = MPI_COMM_NULL; int i, nl = 0, rl = MPI_PROC_NULL;
         MPI_Comm commw = (MPI_Comm)context->comm_ctx;
         assert(-1 != context->comm_ctx);
@@ -1715,6 +1923,21 @@ mpi_no_thread_enable(parsec_comm_engine_t *ce)
     if(parsec_ce_mpi_comm == (MPI_Comm)context->comm_ctx) {
         return PARSEC_SUCCESS;
     }
+#if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT)
+    /* The communication thread need to have a CUDA context in order to be able to use
+     * CUDA managed memory. It should be enough to just create a context onto the first
+     * active device.
+     */
+    for (int dev = 0; dev < (int)parsec_nb_devices; dev++) {
+        parsec_device_module_t *device = parsec_mca_device_get(dev);
+        if (PARSEC_DEV_CUDA & device->type) {
+            parsec_device_gpu_module_t *gpu_dev = (parsec_device_gpu_module_t*)device;
+            gpu_dev->set_device(gpu_dev);
+        }
+    }
+#endif  /* defined(PARSEC_HAVE_DEV_CUDA_SUPPORT) */
+
+
     /* Finish the initialization of the communication engine */
     parsec_ce.mem_register        = mpi_no_thread_mem_register;
     parsec_ce.mem_unregister      = mpi_no_thread_mem_unregister;
@@ -1732,13 +1955,13 @@ mpi_no_thread_enable(parsec_comm_engine_t *ce)
     parsec_ce.send_am             = mpi_no_thread_send_active_message;
 
     /* Initialize the arrays */
-    array_of_callbacks = (mpi_funnelled_callback_t **) calloc(MAX_DYNAMIC_REQ_RANGE,
-                            sizeof(mpi_funnelled_callback_t*));
-    array_of_requests  = (MPI_Request *) calloc(MAX_DYNAMIC_REQ_RANGE, sizeof(MPI_Request));
-    array_of_indices   = (int *) calloc(MAX_DYNAMIC_REQ_RANGE, sizeof(int));
-    array_of_statuses  = (MPI_Status *) calloc(MAX_DYNAMIC_REQ_RANGE, sizeof(MPI_Status));
+    array_of_callbacks = (mpi_funnelled_callback_t *) calloc(parsec_param_comm_mpi_dynamic_requests,
+                            sizeof(mpi_funnelled_callback_t));
+    array_of_requests  = (MPI_Request *) calloc(parsec_param_comm_mpi_dynamic_requests, sizeof(MPI_Request));
+    array_of_indices   = (int *) calloc(parsec_param_comm_mpi_dynamic_requests, sizeof(int));
+    array_of_statuses  = (MPI_Status *) calloc(parsec_param_comm_mpi_dynamic_requests, sizeof(MPI_Status));
 
-    for(i = 0; i < MAX_DYNAMIC_REQ_RANGE; i++) {
+    for(i = 0; i < parsec_param_comm_mpi_dynamic_requests; i++) {
         array_of_requests[i] = MPI_REQUEST_NULL;
     }
 
@@ -1777,8 +2000,6 @@ mpi_no_thread_enable(parsec_comm_engine_t *ce)
     for(i = 0; i < PARSEC_MAX_REGISTERED_TAGS; i++) {
         MPI_Comm_dup((MPI_Comm) context->comm_ctx, &parsec_ce_mpi_am_comm[i]);
     }
-
-    parsec_check_overlapping_binding(context);
 
     parsec_ce_rebuild_am_requests();
     return 1;

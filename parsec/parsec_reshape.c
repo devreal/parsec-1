@@ -2,7 +2,7 @@
  * Copyright (c) 2009-2023 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
- * Copyright (c) 2023      NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2023-2026 NVIDIA Corporation.  All rights reserved.
  */
 
 #include "parsec/parsec_config.h"
@@ -20,6 +20,13 @@
 #define PARSEC_UNFULFILLED_RESHAPE_PROMISE 0
 #define PARSEC_FULFILLED_RESHAPE_PROMISE   1
 
+#if !defined(PARSEC_HAVE_MPI)
+void parsec_local_reshape_cb(parsec_base_future_t *future, ... )
+{
+    (void)future;
+    parsec_fatal("Data reshaping requires MPI datatype support");
+}
+#endif  /* !defined(PARSEC_HAVE_MPI) */
 
 /**
  *
@@ -50,8 +57,8 @@ void parsec_cleanup_reshape_promise(parsec_base_future_t *future)
         free(match_data);
     }
     if(d_fut->super.tracked_data != NULL){
-        parsec_data_copy_t * data = (parsec_data_copy_t*) d_fut->super.tracked_data;
-        PARSEC_DATA_COPY_RELEASE(data);
+        parsec_data_copy_t * copy = (parsec_data_copy_t*) d_fut->super.tracked_data;
+        PARSEC_DATA_COPY_RELEASE(copy);
     }
 }
 
@@ -141,7 +148,7 @@ parsec_new_reshape_promise(parsec_dep_data_description_t* data,
      * going to consume the original data->data in order to reshape it, and
      * all other successors will use directly the reshaped data instead.
      */
-    PARSEC_OBJ_RETAIN( future_in_data->data );
+    PARSEC_DATA_COPY_RETAIN( future_in_data->data );
 
     return data_future;
 }
@@ -235,7 +242,7 @@ void parsec_setup_nested_future(parsec_datacopy_future_t** future, ...)
  *
  * @param[out] setup_repo repo on which the reshape has been set up.
  * @param[out] setup_repo_key key on repo on which the reshape has been set up.
- * @param[inout] ouput_usage counter for the predecessor repo usage.
+ * @param[inout] output_usage counter for the predecessor repo usage.
  *
  * @param[in] promise_type fulfilled or unfulfilled reshape promise.
  */
@@ -278,7 +285,7 @@ parsec_create_reshape_promise(parsec_execution_stream_t *es,
 
     if ( predecessor_repo_entry->data[predecessor_dep_flow_index] != NULL ) {
         if(promise_type == PARSEC_UNFULFILLED_RESHAPE_PROMISE) {
-            /* New unfulfilled reshape promises are set up on the succcessor repo
+            /* New unfulfilled reshape promises are set up on the successor repo
              * in case the predecessor repo is already occupied. */
             *setup_repo = successor_repo;
             *setup_repo_key = successor_repo_key;
@@ -331,7 +338,7 @@ parsec_create_reshape_promise(parsec_execution_stream_t *es,
     }
 #endif
 
-    /* retain the future if it's being reuse. */
+    /* retain the future if it's being reused. */
     if ( !new_future ) PARSEC_OBJ_RETAIN(data->data_future);
 
     /* Set up the reshape promise. */
@@ -439,7 +446,7 @@ parsec_set_up_reshape_promise(parsec_execution_stream_t *es,
             /* Data has been received with the expected remote type of the
              * successor contained on data->data->dtt. */
             data->local.dst_datatype = data->local.src_datatype = data->data->dtt;
-        }else{
+        } else {
             /* Packed data because multiple unpacking alternatives at reception. */
             const parsec_task_class_t* fct = newcontext->task_class;
             uint32_t flow_mask = (1U << dep->flow->flow_index) | 0x80000000;  /* in flow */
@@ -451,7 +458,14 @@ parsec_set_up_reshape_promise(parsec_execution_stream_t *es,
             }
             data->local = aux_data.remote;
             data->local.src_datatype = PARSEC_DATATYPE_PACKED;
+#if defined(PARSEC_HAVE_MPI)
             MPI_Pack_size(aux_data.remote.dst_count, aux_data.remote.dst_datatype , MPI_COMM_WORLD, &dsize);
+#else
+            if( PARSEC_SUCCESS != parsec_type_size(aux_data.remote.dst_datatype, &dsize) ) {
+                dsize = 0;
+            }
+            dsize *= aux_data.remote.dst_count;
+#endif
             data->local.src_count = dsize;
 
             /* Check if the previous future set up on iterate successor is tracking the same
@@ -574,12 +588,12 @@ parsec_get_copy_reshape_inline(parsec_execution_stream_t *es,
 
     /* Set up the reshaping promise */
     reshape_repo_entry = data_repo_lookup_entry(reshape_repo, reshape_entry_key);
-    assert( reshape_repo_entry != NULL ); /* repo has been created at the begining of data_lookup*/
+    assert( reshape_repo_entry != NULL ); /* repo has been created at the beginning of data_lookup*/
     if (reshape_repo_entry != NULL){ /* reshape promise already set up on the repo */
         data->data_future = (parsec_datacopy_future_t*)reshape_repo_entry->data[dep_flow_index];
     }
 
-    if(data->data_future == NULL){
+    if(data->data_future == NULL) {
         parsec_create_reshape_promise(es,
                                       data,
                                       0, -1, -1, /* no src dst rank */
@@ -595,9 +609,6 @@ parsec_get_copy_reshape_inline(parsec_execution_stream_t *es,
         char task_name[MAX_TASK_STRLEN];
         parsec_task_snprintf(task_name, MAX_TASK_STRLEN, task);
 
-        char type_string[MAX_TASK_STRLEN]="UNFULFILLED";
-        char orig_string[MAX_TASK_STRLEN]="LOCAL INLINE";
-
         char type_name_src[MAX_TASK_STRLEN] = "NULL";
         char type_name_dst[MAX_TASK_STRLEN] = "NULL";
         char type_name_data[MAX_TASK_STRLEN] = "NULL";
@@ -608,12 +619,11 @@ parsec_get_copy_reshape_inline(parsec_execution_stream_t *es,
 
         PARSEC_DEBUG_VERBOSE(12, parsec_debug_output,
                              "th%d RESHAPE_PROMISE CREATE %s %s [%s:%p:%p -> %p] flow_idx %u fut %p on %s(%p) k%d dtt %s -> %s [data %s]",
-                             es->th_id, type_string, orig_string, task_name, data->data, data->data->dtt,
+                             es->th_id, "UNFULFILLED", "LOCAL INLINE", task_name, data->data, data->data->dtt,
                              data->local.dst_datatype,
                              dep_flow_index,
                              data->data_future,
                              "CURR_REPO", setup_repo, setup_repo_key, type_name_src, type_name_dst, type_name_data);
-
 #endif
     }
 
@@ -629,7 +639,7 @@ parsec_get_copy_reshape_inline(parsec_execution_stream_t *es,
                          es->th_id, *reshape, (*reshape)->dtt, data->data_future);
 
     /* reshape completed */
-    PARSEC_OBJ_RETAIN(*reshape);
+    PARSEC_DATA_COPY_RETAIN(*reshape);
     PARSEC_OBJ_RELEASE(data->data_future);
     /* Clean up the old stuff on the repo used temporarily to hold
      * the inline reshape promise.
@@ -642,7 +652,7 @@ parsec_get_copy_reshape_inline(parsec_execution_stream_t *es,
 /**
  *
  * Routine to obtain a reshaped copy matching the specifications when reading
- * a tile from the datacollection.
+ * a tile from the data collection.
  * If a reshape needs to be performed, it is done using an inline reshape
  * promise, i.e., creating and fulfilling a local future promise (only
  * the current task instance is involved). Each thread accessing the same
@@ -769,7 +779,7 @@ parsec_get_copy_reshape_from_dep(parsec_execution_stream_t *es,
                          "th%d RESHAPE_PROMISE OBTAINED [%p:%p] for %s fut %p",
                          es->th_id, *reshape, (*reshape)->dtt, task_string, data->data_future);
 
-    PARSEC_OBJ_RETAIN(*reshape);
+    PARSEC_DATA_COPY_RETAIN(*reshape);
     PARSEC_OBJ_RELEASE(data->data_future);
 
     return PARSEC_HOOK_RETURN_RESHAPE_DONE;

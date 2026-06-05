@@ -3,6 +3,7 @@
  * Copyright (c) 2009-2022 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
+ * Copyright (c) 2026      NVIDIA Corporation.  All rights reserved.
  */
 
 #include "parsec/parsec_config.h"
@@ -13,11 +14,11 @@
 #include "parsec/vpmap.h"
 #include "parsec/runtime.h"
 #include "parsec/data.h"
-#include <string.h>
 #if defined(__WINDOWS__)
 #define _CRT_RAND_S
-#include <stdlib.h>
 #endif
+#include <stdlib.h>
+#include <string.h>
 
 static uint32_t      twoDTD_rank_of(    parsec_data_collection_t* dc, ... );
 static uint32_t      twoDTD_rank_of_key(parsec_data_collection_t* dc, parsec_data_key_t key);
@@ -235,7 +236,7 @@ void parsec_matrix_tabular_set_random_table(parsec_matrix_tabular_t *dc,
                                                 + (nbtiles-1)*sizeof(parsec_two_dim_td_table_elem_t) );
     table->nbelem = nbtiles;
 
-    nbvp = vpmap_get_nb_vp();
+    nbvp = parsec_vpmap_get_nb_vp();
 #if defined(__WINDOWS__)
     rand_s(&rankseed);
     rand_s(&vpseed);

@@ -7,16 +7,6 @@
 #include "redistribute.h"
 #include "redistribute_reshuffle.h"
 
-static inline int parsec_imin(int a, int b)
-{
-    return (a <= b) ? a : b;
-};
-
-static inline int parsec_imax(int a, int b)
-{
-    return (a >= b) ? a : b;
-};
-
 /**
  * @brief New function for redistribute
  *
@@ -67,18 +57,22 @@ parsec_redistribute_New(parsec_tiled_matrix_t *dcY,
         return NULL;
     }
 
+    if( !redistribute_region_is_stored(dcY, size_row, size_col, disi_Y, disj_Y) ) {
+        if( 0 == dcY->super.myrank )
+            parsec_warning("ERROR: Submatrix references unstored SOURCE tiles\n");
+        return NULL;
+    }
+
+    if( !redistribute_region_is_stored(dcT, size_row, size_col, disi_T, disj_T) ) {
+        if( 0 == dcY->super.myrank )
+            parsec_warning("ERROR: Submatrix references unstored TARGET tiles\n");
+        return NULL;
+    }
+
     /* Check distribution, and determine batch size: num_col */
-    if( (dcY->dtype & parsec_matrix_tabular_type) && (dcT->dtype & parsec_matrix_tabular_type) ) {
-        num_cols = parsec_imin( ceil(size_col/dcY->nb), dcY->super.nodes );
-    } else if( (dcY->dtype & parsec_matrix_tabular_type) && (dcT->dtype & parsec_matrix_block_cyclic_type) ) {
-        num_cols = ((parsec_matrix_block_cyclic_t *)dcT)->grid.cols * ((parsec_matrix_block_cyclic_t *)dcT)->grid.kcols;
-    } else if( (dcY->dtype & parsec_matrix_block_cyclic_type) && (dcT->dtype & parsec_matrix_tabular_type) ) {
-        num_cols = ((parsec_matrix_block_cyclic_t *)dcY)->grid.cols * ((parsec_matrix_block_cyclic_t *)dcY)->grid.kcols;
-    } else if( (dcY->dtype & parsec_matrix_block_cyclic_type) && (dcT->dtype & parsec_matrix_block_cyclic_type) ) {
-        num_cols = parsec_imax( ((parsec_matrix_block_cyclic_t *)dcY)->grid.cols * ((parsec_matrix_block_cyclic_t *)dcY)->grid.kcols,
-                                ((parsec_matrix_block_cyclic_t *)dcT)->grid.cols * ((parsec_matrix_block_cyclic_t *)dcT)->grid.kcols );
-    } else {
-        parsec_warning("This version of data redistribution only supports parsec_matrix_block_cyclic_type and parsec_matrix_tabular_type");
+    num_cols = redistribute_pair_num_cols(dcY, dcT, size_col);
+    if( num_cols <= 0 ) {
+        parsec_warning("This version of data redistribution only supports parsec_matrix_block_cyclic_type, parsec_matrix_tabular_type, and parsec_matrix_sbc_type");
         return NULL;
     }
 
@@ -97,10 +91,8 @@ parsec_redistribute_New(parsec_tiled_matrix_t *dcY,
         int n_T_END = (size_col+disj_T-1) / dcT->nb;
         taskpool->_g_NT = (n_T_END-n_T_START)/taskpool->_g_num_col;
 
-        parsec_add2arena(&taskpool->arenas_datatypes[PARSEC_redistribute_reshuffle_DEFAULT_ADT_IDX],
-                         MY_TYPE, PARSEC_MATRIX_FULL,
-                         1, dcY->mb, dcY->nb, dcY->mb,
-                         PARSEC_ARENA_ALIGNMENT_SSE, -1 );
+        parsec_matrix_adt_define_rect(&taskpool->arenas_datatypes[PARSEC_redistribute_reshuffle_DEFAULT_ADT_IDX],
+                         MY_TYPE, dcY->mb, dcY->nb, dcY->mb);
         /* General version */
     } else {
         parsec_redistribute_taskpool_t* taskpool = NULL;
@@ -118,23 +110,17 @@ parsec_redistribute_New(parsec_tiled_matrix_t *dcY,
         int n_T_END = (size_col+disj_T-1) / (dcT->nb-2*R);
         taskpool->_g_NT = (n_T_END-n_T_START)/taskpool->_g_num_col;
 
-        parsec_add2arena(&taskpool->arenas_datatypes[PARSEC_redistribute_DEFAULT_ADT_IDX],
-                         MY_TYPE, PARSEC_MATRIX_FULL,
-                         1, 1, 1, 1,
-                         PARSEC_ARENA_ALIGNMENT_SSE, -1 );
+        parsec_matrix_adt_define_square(&taskpool->arenas_datatypes[PARSEC_redistribute_DEFAULT_ADT_IDX],
+                         MY_TYPE, 1);
 
         int Y_LDA = dcY->storage == PARSEC_MATRIX_LAPACK ? dcY->llm : dcY->mb;
         int T_LDA = dcT->storage == PARSEC_MATRIX_LAPACK ? dcT->llm : dcT->mb;
 
-        parsec_add2arena(&taskpool->arenas_datatypes[PARSEC_redistribute_TARGET_ADT_IDX],
-                         MY_TYPE, PARSEC_MATRIX_FULL,
-                         1, dcT->mb, dcT->nb, T_LDA,
-                         PARSEC_ARENA_ALIGNMENT_SSE, -1 );
+        parsec_matrix_adt_define_rect(&taskpool->arenas_datatypes[PARSEC_redistribute_TARGET_ADT_IDX],
+                         MY_TYPE, dcT->mb, dcT->nb, T_LDA);
 
-        parsec_add2arena(&taskpool->arenas_datatypes[PARSEC_redistribute_INNER_ADT_IDX],
-                         MY_TYPE, PARSEC_MATRIX_FULL,
-                         1, dcY->mb-2*R, dcY->nb-2*R, Y_LDA,
-                         PARSEC_ARENA_ALIGNMENT_SSE, -1 );
+        parsec_matrix_adt_define_rect(&taskpool->arenas_datatypes[PARSEC_redistribute_INNER_ADT_IDX],
+                         MY_TYPE, dcY->mb-2*R, dcY->nb-2*R, Y_LDA);
     }
 
     return redistribute_taskpool;
@@ -156,12 +142,12 @@ __parsec_redistribute_destructor(parsec_redistribute_taskpool_t *redistribute_ta
         && (redistribute_taskpool->_g_disj_T % redistribute_taskpool->_g_descT->nb == 0) )
     {
         parsec_redistribute_reshuffle_taskpool_t *redistribute_reshuffle_taskpool = (parsec_redistribute_reshuffle_taskpool_t *)redistribute_taskpool;
-        parsec_del2arena(&redistribute_reshuffle_taskpool->arenas_datatypes[PARSEC_redistribute_reshuffle_DEFAULT_ADT_IDX]);
+        parsec_matrix_arena_datatype_destruct_free_type(&redistribute_reshuffle_taskpool->arenas_datatypes[PARSEC_redistribute_reshuffle_DEFAULT_ADT_IDX]);
     } else {
-        parsec_del2arena(&redistribute_taskpool->arenas_datatypes[PARSEC_redistribute_DEFAULT_ADT_IDX]);
-        parsec_del2arena(&redistribute_taskpool->arenas_datatypes[PARSEC_redistribute_TARGET_ADT_IDX]);
-        // parsec_del2arena(&redistribute_taskpool->arenas_datatypes[PARSEC_redistribute_SOURCE_ADT_IDX]);
-        parsec_del2arena(&redistribute_taskpool->arenas_datatypes[PARSEC_redistribute_INNER_ADT_IDX]);
+        parsec_matrix_arena_datatype_destruct_free_type(&redistribute_taskpool->arenas_datatypes[PARSEC_redistribute_DEFAULT_ADT_IDX]);
+        parsec_matrix_arena_datatype_destruct_free_type(&redistribute_taskpool->arenas_datatypes[PARSEC_redistribute_TARGET_ADT_IDX]);
+        // parsec_matrix_arena_datatype_destruct_free_type(&redistribute_taskpool->arenas_datatypes[PARSEC_redistribute_SOURCE_ADT_IDX]);
+        parsec_matrix_arena_datatype_destruct_free_type(&redistribute_taskpool->arenas_datatypes[PARSEC_redistribute_INNER_ADT_IDX]);
     }
 }
 
@@ -205,4 +191,3 @@ int parsec_redistribute(parsec_context_t *parsec,
 
     return PARSEC_ERR_NOT_SUPPORTED;
 }
-

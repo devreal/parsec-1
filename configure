@@ -70,6 +70,8 @@ cat <<EOF
 
 --enable-prof-trace
                 produce a trace of the execution that can be analyzed in a trace vizualizer
+--enable-prof-nvtx
+                emit profiling events as NVTX ranges for NVIDIA Nsight Systems
 --enable-prof-calltrace
                 print a message when each task body is executed
 --enable-prof-dryrun=yes|dep|body|no
@@ -89,6 +91,8 @@ cat <<EOF
                 use the PAPI performance counter package [installed in DIR] (default=autodetect)
 --with-ayudame[=DIR]
                 use the Ayudame package [installed in DIR] (optional)
+--with-nvtx[=DIR]
+                use NVTX headers [installed in DIR] for Nsight Systems annotations
 
 --with-hwloc[=DIR]
                 use the HWLoc package [installed in DIR] (default=autodetect)
@@ -103,7 +107,8 @@ cat <<EOF
                 use the MPI communication library [installed in DIR] (default=autodetect)
 --enable-collectives
                 use asynchronous dataflow collective communication
-
+--enable-mpi-gpu-aware
+                assume the MPI communication library can send/receive from GPU data buffers directly
 
 --with-cuda[=DIR]
                 use the CUDA accelerator libray [installed in DIR] (default=autodetect)
@@ -200,6 +205,8 @@ while [ "x$1" != x ]; do
         --disable-doc) enable_doc=no; shift;;
         --enable-testing) enable_testing=yes; shift;;
         --disable-testing) enable_testing=no; shift;;
+        --enable-tools) enable_tools=yes; shift;;
+        --disable-tools) enable_tools=no; shift;;
 
 #debug/profiling
         --enable-debug=*) enable_debug="${1#*=}"; shift;;
@@ -207,6 +214,8 @@ while [ "x$1" != x ]; do
         --disable-debug) enable_debug=no; shift;;
         --enable-prof-trace) enable_prof_trace=yes; shift;;
         --disable-prof-trace) enable_prof_trace=no; shift;;
+        --enable-prof-nvtx|--enable-nvtx) enable_prof_nvtx=yes; shift;;
+        --disable-prof-nvtx|--disable-nvtx) enable_prof_nvtx=no; shift;;
         --enable-prof-calltrace) enable_prof_calltrace=yes; shift;;
         --disable-prof-calltrace) enable_prof_calltrace=no; shift;;
         --enable-prof-dryrun=*) enable_prof_dryrun="${1#*=}"; shift;;
@@ -229,6 +238,9 @@ while [ "x$1" != x ]; do
         --with-ayudame=*) with_ayudame="${1#*=}"; shift;;
         --with-ayudame) with_ayudame=yes; shift;;
         --without-ayudame) with_ayudame=no; shift;;
+        --with-nvtx=*) with_nvtx="${1#*=}"; shift;;
+        --with-nvtx) with_nvtx=yes; shift;;
+        --without-nvtx) with_nvtx=no; shift;;
 
 # MPI options
         --with-mpi=*) with_mpi="${1#*=}"; shift;;
@@ -236,6 +248,8 @@ while [ "x$1" != x ]; do
         --without-mpi) with_mpi=no; shift;;
         --enable-collectives) enable_collectives=yes; shift;;
         --disable-collectives) enable_collectives=no; shift;;
+        --enable-mpi-gpu-aware) enable_mpi_gpu_aware=yes; shift;;
+        --disable-mpi-gpu-aware) enable_mpi_gpu_aware=no; shift;;
 
 # Hwloc options
         --with-hwloc=*) with_hwloc="${1#*=}"; shift;;
@@ -328,7 +342,7 @@ function set_python_venv {
       mkdir -p venv
       ${PYTHON_EXECUTABLE:-python3} -m venv venv --upgrade-deps 2>&1 >venv/config.log || (cat >&2 venv/config.log && exit 3)
         source venv/bin/activate
-        python -m pip install --require-virtualenv Cython pandas matplotlib tables networkx wheel 2>&1 >>venv/config.log || (cat >&2 venv/config.log && exit 3)
+        python -m pip install --require-virtualenv Cython pandas matplotlib tables networkx setuptools wheel 2>&1 >>venv/config.log || (cat >&2 venv/config.log && exit 3)
     else
         echo >&2 "Could not prepare a Python venv because \`-m venv\` is not supported by the selected python..." && exit 3
     fi
@@ -452,6 +466,8 @@ CMAKE_DEFINES+=" ${prefix:+-DCMAKE_INSTALL_PREFIX=$prefix}"
 [ x$enable_doc = xno ] && CMAKE_DEFINES+=" -DBUILD_DOCUMENTATION=OFF"
 [ x$enable_testing = xyes ] && CMAKE_DEFINES+=" -DBUILD_TESTING=ON"
 [ x$enable_testing = xno ] && CMAKE_DEFINES+=" -DBUILD_TESTING=OFF"
+[ x$enable_tools = xyes ] && CMAKE_DEFINES+=" -DBUILD_TOOLS=ON"
+[ x$enable_tools = xno ] && CMAKE_DEFINES+=" -DBUILD_TOOLS=OFF"
 
 if [ -z "$enable_debug" ]; then CMAKE_DEFINES+=" -DCMAKE_BUILD_TYPE=RelWithDebInfo"
 elif [[ "$enable_debug" =~ ^no$ ]]; then
@@ -468,6 +484,16 @@ else echo >&2 "Option $enable_debug is invalid (can be yes|paranoid|noisier|hist
 
 [ x$enable_prof_trace = xyes ] && CMAKE_DEFINES+=" -DPARSEC_PROF_TRACE=ON"
 [ x$enable_prof_trace = xno ] && CMAKE_DEFINES+=" -DPARSEC_PROF_TRACE=OFF"
+
+case x$with_nvtx in
+xno) enable_prof_nvtx=no;;
+xyes) enable_prof_nvtx=yes;;
+x) ;;
+*) enable_prof_nvtx=yes
+   CMAKE_DEFINES+=" -DPARSEC_NVTX_ROOT=$(printf %q "$with_nvtx")";;
+esac
+[ x$enable_prof_nvtx = xyes ] && CMAKE_DEFINES+=" -DPARSEC_PROF_TRACE=ON -DPARSEC_PROF_TRACE_NVTX=ON"
+[ x$enable_prof_nvtx = xno ] && CMAKE_DEFINES+=" -DPARSEC_PROF_TRACE_NVTX=OFF"
 [ x$enable_prof_calltrace = xyes ] && CMAKE_DEFINES+=" -DPARSEC_PROF_CALLTRACE=ON"
 [ x$enable_prof_calltrace = xno ] && CMAKE_DEFINES+=" -DPARSEC_PROF_CALLTRACE=OFF"
 [ x$enable_prof_grapher = xyes ] && CMAKE_DEFINES+=" -DPARSEC_PROF_GRAPHER=ON"
@@ -523,7 +549,8 @@ x) ;;
 esac
 [ x$enable_collectives = xyes ] && CMAKE_DEFINES+=" -DPARSEC_DIST_COLLECTIVES=ON"
 [ x$enable_collectives = xno ] && CMAKE_DEFINES+=" -DPARSEC_DIST_COLLECTIVES=OFF"
-
+[ x$enable_mpi_gpu_aware = xyes ] && CMAKE_DEFINES+=" -DPARSEC_MPI_IS_GPU_AWARE=ON"
+[ x$enable_mpi_gpu_aware = xno ] && CMAKE_DEFINES+=" -DPARSEC_MPI_IS_GPU_AWARE=OFF"
 
 case x$with_cuda in
 xno) CMAKE_DEFINES+=" -DPARSEC_GPU_WITH_CUDA=OFF";;
@@ -602,4 +629,3 @@ if [ x$nocreate != xyes ]; then
 #
 EOF
 fi
-

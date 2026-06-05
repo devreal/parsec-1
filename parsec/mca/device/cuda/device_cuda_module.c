@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2010-2024 The University of Tennessee and The University
+ * Copyright (c) 2010-2025 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
- * Copyright (c) 2024      NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2024-2026 NVIDIA Corporation.  All rights reserved.
  */
 
 #include "parsec/parsec_config.h"
@@ -195,7 +195,7 @@ parsec_cuda_memory_register(parsec_device_module_t* device, parsec_data_collecti
 
     /*
      * We rely on the thread-safety of the CUDA interface to register the memory
-     * as another thread might be submiting tasks at the same time
+     * as another thread might be submitting tasks at the same time
      * (cuda_scheduling.h), and we do not set a device since we register it for
      * all devices.
      */
@@ -307,18 +307,18 @@ static void* parsec_cuda_find_incarnation(parsec_device_gpu_module_t* gpu_device
 
 static int parsec_cuda_set_device(parsec_device_gpu_module_t *gpu)
 {
-    cudaError_t cudaStatus;
+    cudaError_t status;
     parsec_device_cuda_module_t *cuda_device = (parsec_device_cuda_module_t *)gpu;
 
-    cudaStatus = cudaSetDevice(cuda_device->cuda_index);
-    PARSEC_CUDA_CHECK_ERROR( "cudaSetDevice", cudaStatus, {return PARSEC_ERROR;} );
+    status = cudaSetDevice(cuda_device->cuda_index);
+    PARSEC_CUDA_CHECK_ERROR( "cudaSetDevice", status, {return PARSEC_ERROR;} );
     return PARSEC_SUCCESS;
 }
 
 static int parsec_cuda_memcpy_async(struct parsec_device_gpu_module_s *gpu, struct parsec_gpu_exec_stream_s *gpu_stream,
                                         void *dest, void *source, size_t bytes, parsec_device_transfer_direction_t direction)
 {
-    cudaError_t cudaStatus;
+    cudaError_t status;
     enum cudaMemcpyKind kind;
     parsec_cuda_exec_stream_t *cuda_stream = (parsec_cuda_exec_stream_t *)gpu_stream;
 
@@ -338,45 +338,45 @@ static int parsec_cuda_memcpy_async(struct parsec_device_gpu_module_s *gpu, stru
         PARSEC_CUDA_CHECK_ERROR( "Translate parsec_device_transfer_direction_t to cudaMemcpyKind", cudaErrorInvalidValue, {return PARSEC_ERROR;} );
     }
 
-    cudaStatus =  cudaMemcpyAsync( dest, source, bytes, kind, cuda_stream->cuda_stream );
-    PARSEC_CUDA_CHECK_ERROR( "cudaMemcpyAsync", cudaStatus, {return PARSEC_ERROR;} );
+    status =  cudaMemcpyAsync( dest, source, bytes, kind, cuda_stream->cuda_stream );
+    PARSEC_CUDA_CHECK_ERROR( "cudaMemcpyAsync", status, {return PARSEC_ERROR;} );
     return PARSEC_SUCCESS;
 }
 
 static int parsec_cuda_event_record(struct parsec_device_gpu_module_s *gpu, struct parsec_gpu_exec_stream_s *gpu_stream, int32_t event_idx)
 {
     parsec_cuda_exec_stream_t *cuda_stream = (parsec_cuda_exec_stream_t*)gpu_stream;
-    cudaError_t cudaStatus;
+    cudaError_t status;
     (void)gpu;
 
-    cudaStatus = cudaEventRecord(cuda_stream->events[event_idx], cuda_stream->cuda_stream);
-    PARSEC_CUDA_CHECK_ERROR( "cudaEventRecord", cudaStatus, {return PARSEC_ERROR;} );
+    status = cudaEventRecord(cuda_stream->events[event_idx], cuda_stream->cuda_stream);
+    PARSEC_CUDA_CHECK_ERROR( "cudaEventRecord", status, {return PARSEC_ERROR;} );
     return PARSEC_SUCCESS;
 }
 
 static int parsec_cuda_event_query(struct parsec_device_gpu_module_s *gpu, struct parsec_gpu_exec_stream_s *gpu_stream, int32_t event_idx)
 {
     parsec_cuda_exec_stream_t *cuda_stream = (parsec_cuda_exec_stream_t*)gpu_stream;
-    cudaError_t cudaStatus;
+    cudaError_t status;
     (void)gpu;
 
-    cudaStatus = cudaEventQuery(cuda_stream->events[event_idx]);
-    if(cudaSuccess == cudaStatus) {
+    status = cudaEventQuery(cuda_stream->events[event_idx]);
+    if(cudaSuccess == status) {
         return 1;
     }
-    if(cudaErrorNotReady == cudaStatus) {
+    if(cudaErrorNotReady == status) {
         return 0;
     }
-    PARSEC_CUDA_CHECK_ERROR( "cudaEventQuery", cudaStatus, {return PARSEC_ERROR;} );
+    PARSEC_CUDA_CHECK_ERROR( "cudaEventQuery", status, {return PARSEC_ERROR;} );
     return PARSEC_ERROR; /* should be unreachable */
 }
 
 static int parsec_cuda_memory_info(struct parsec_device_gpu_module_s *gpu, size_t *free_mem, size_t *total_mem)
 {
-    cudaError_t cudaStatus;
+    cudaError_t status;
     (void)gpu;
-    cudaStatus = cudaMemGetInfo(free_mem, total_mem);
-    PARSEC_CUDA_CHECK_ERROR( "cudaMemGetInfo", cudaStatus, {return PARSEC_ERROR;});
+    status = cudaMemGetInfo(free_mem, total_mem);
+    PARSEC_CUDA_CHECK_ERROR( "cudaMemGetInfo", status, {return PARSEC_ERROR;});
     /* sanity check: no more free memory than total memory
      * some hip devices on Frontier may report more free memory than is available */
     if (*free_mem > *total_mem) {
@@ -387,19 +387,19 @@ static int parsec_cuda_memory_info(struct parsec_device_gpu_module_s *gpu, size_
 
 static int parsec_cuda_memory_allocate(struct parsec_device_gpu_module_s *gpu, size_t bytes, void **addr)
 {
-    cudaError_t cudaStatus;
+    cudaError_t status;
     (void)gpu;
-    cudaStatus = cudaMalloc(addr, bytes);
-    PARSEC_CUDA_CHECK_ERROR( "cudaMalloc", cudaStatus, {return PARSEC_ERROR;});
+    status = cudaMalloc(addr, bytes);
+    PARSEC_CUDA_CHECK_ERROR( "cudaMalloc", status, {return PARSEC_ERROR;});
     return PARSEC_SUCCESS;
 }
 
 static int parsec_cuda_memory_free(struct parsec_device_gpu_module_s *gpu, void *addr)
 {
-    cudaError_t cudaStatus;
+    cudaError_t status;
     (void)gpu;
-    cudaStatus = cudaFree(addr);
-    PARSEC_CUDA_CHECK_ERROR( "cudaFree", cudaStatus, {return PARSEC_ERROR;});
+    status = cudaFree(addr);
+    PARSEC_CUDA_CHECK_ERROR( "cudaFree", status, {return PARSEC_ERROR;});
     return PARSEC_SUCCESS;
 }
 
@@ -411,9 +411,8 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
     parsec_device_gpu_module_t* gpu_device;
     parsec_device_module_t* device;
     cudaError_t cudastatus;
-    int show_caps_index, show_caps = 0, j, k;
+    int show_caps_index, show_caps = 0, j, k, freqHz;
     char *szName;
-    uint64_t freqHz;
     double fp16, fp32, fp64, tf32;
     struct cudaDeviceProp prop;
 
@@ -431,10 +430,16 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
     szName    = prop.name;
     major     = prop.major;
     minor     = prop.minor;
-    freqHz    = prop.clockRate * 1000;  /* clockRate is in KHz */
+    /* up to CUDA 12.3, clockRate is in KHz */
+#if CUDART_VERSION >= 12030
+    cudaDeviceGetAttribute(&freqHz, cudaDevAttrClockRate, dev_id);
+    computemode = cudaComputeModeDefault;  /* default value until I figure out how to retrieve it */
+#else
+    freqHz    = (int)prop.clockRate * 1000;  /* clockRate is in KHz */
+    computemode = prop.computeMode;
+#endif
     concurrency = prop.concurrentKernels;
     streaming_multiprocessor = prop.multiProcessorCount;
-    computemode = prop.computeMode;
 
     // We use calloc because we need some fields to be zero-initialized to ensure graceful handling of errors
     cuda_device = (parsec_device_cuda_module_t*)calloc(1, sizeof(parsec_device_cuda_module_t));
@@ -587,15 +592,23 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
     }
 
     if( show_caps ) {
+        int memoryClockRateKHz, memoryBusWidth;
+#if CUDART_VERSION >= 12030
+        cudaDeviceGetAttribute(&memoryClockRateKHz, cudaDevAttrMemoryClockRate, dev_id);
+        cudaDeviceGetAttribute(&memoryBusWidth, cudaDevAttrGlobalMemoryBusWidth, dev_id);
+#else
+        memoryClockRateKHz = (int)prop.memoryClockRate;
+        memoryBusWidth = prop.memoryBusWidth;
+#endif
         parsec_inform("Dev GPU %10s : %s %.0fGB [pci %x:%x.%x]\n"
-                      "\tFrequency (GHz)    : %.2f\t[SM: %d | Capabilities: %d.%d | Concurency %s | ComputeMode %d]\n"
+                      "\tFrequency (GHz)    : %.2f\t[SM: %d | Capabilities: %d.%d | Concurrency %s | ComputeMode %d]\n"
                       "\tPeak Tflop/s %-5s : fp64: %-8.3f fp32: %-8.3f fp16: %-8.3f tf32: %-8.3f\n"
                       "\tPeak Mem Bw (GB/s) : %.2f\t[Clock Rate (Ghz) %.2f | Bus Width (bits) %d]\tReserved Pool (GB): %.1f\n",
                       device->name, szName, prop.totalGlobalMem/1024.f/1024.f/1024.f, prop.pciBusID, prop.pciDeviceID, prop.pciDomainID,
                       freqHz*1e-9f, streaming_multiprocessor, cuda_device->major, cuda_device->minor,
                       (concurrency == 1)? "yes": "no", computemode,
                       device->gflops_guess? "GUESS": "", fp64*1e-3, fp32*1e-3, fp16*1e-3, tf32*1e-3,
-                      2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6, prop.memoryClockRate*1e-6, prop.memoryBusWidth, gpu_device->mem_block_size*gpu_device->mem_nb_blocks/1024.f/1024.f/1024.f);
+                      2.0*memoryClockRateKHz*(memoryBusWidth/8)/1.0e6, memoryClockRateKHz*1e-6, memoryBusWidth, gpu_device->mem_block_size*gpu_device->mem_nb_blocks/1024.f/1024.f/1024.f);
     }
 
     *module = device;

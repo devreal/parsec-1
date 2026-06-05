@@ -255,7 +255,7 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
         parsec_atomic_lock( &gpu_copy->original->lock );
         /* get the next item before altering the next pointer */
         item = (parsec_list_item_t*)item->list_next;  /* conversion needed for volatile */
-        if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) {
+        if (NULL != cpu_copy && (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED)) {
             parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
             PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
             PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
@@ -265,6 +265,20 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
             parsec_device_release_gpu_copy(gpu_device, gpu_copy);
             nb_discarded++;
         } else if( 0 == gpu_copy->readers ) {
+            if( NULL == gpu_copy->original->device_copies[0] ) {
+                /* This background write-to-read cleanup task has no producer
+                 * or receiver flow attached to it, so it cannot recover the
+                 * arena/datatype needed to recreate a missing CPU mirror. Leave
+                 * GPU-only self-contained data for the real successor pushout,
+                 * where the receiving flow can be queried with get_datatype().
+                 */
+                PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
+                                     "D2H[%d:%s]: skip GPU-only copy %p [%p]; no host mirror and no receiver flow metadata",
+                                     gpu_device->super.device_index, gpu_device->super.name,
+                                     gpu_copy, gpu_copy->original);
+                parsec_atomic_unlock( &gpu_copy->original->lock );
+                continue;
+            }
             if( PARSEC_UNLIKELY(NULL == d2h_task) ) {  /* allocate on-demand */
                 d2h_task = (parsec_gpu_d2h_task_t*)parsec_thread_mempool_allocate(es->context_mempool);
                 if( PARSEC_UNLIKELY(NULL == d2h_task) ) { /* we're running out of memory. Bail out. */
@@ -303,12 +317,11 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
     d2h_task->taskpool        = NULL;
     d2h_task->locals[0].value = nb_cleaned;
 
-    w2r_task = (parsec_gpu_task_t *)malloc(sizeof(parsec_gpu_task_t));
-    PARSEC_OBJ_CONSTRUCT(w2r_task, parsec_list_item_t);
-    w2r_task->release_device_task   = free;  /* by default free the device task */
+    w2r_task = (parsec_gpu_task_t *)PARSEC_OBJ_NEW(parsec_gpu_dsl_task_t);
     w2r_task->ec                    = (parsec_task_t*)d2h_task;
     w2r_task->task_type             = PARSEC_GPU_TASK_TYPE_D2HTRANSFER;
     w2r_task->last_data_check_epoch = gpu_device->data_avail_epoch - 1;
+    w2r_task->nb_flows              = nb_cleaned;
     w2r_task->stage_in              = NULL;
     w2r_task->stage_out             = &parsec_default_gpu_stage_out;
     w2r_task->complete_stage        = NULL;
@@ -336,7 +349,7 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device,
         parsec_atomic_lock(&gpu_copy->original->lock);
         gpu_copy->readers--;
         gpu_copy->data_transfer_status = PARSEC_DATA_STATUS_COMPLETE_TRANSFER;
-        gpu_device->super.data_out_to_host += gpu_copy->original->nb_elts; /* TODO: not hardcoded, use datatype size */
+        gpu_device->super.data_out_to_host += gpu_copy->original->span; /* TODO: not hardcoded, use datatype size */
         assert(gpu_copy->readers >= 0);
 
         original = gpu_copy->original;
@@ -370,7 +383,7 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device,
         parsec_atomic_unlock(&gpu_copy->original->lock);
     }
     parsec_thread_mempool_free(es->context_mempool, task);
-    free(gpu_task);
+    PARSEC_OBJ_RELEASE(gpu_task); /* no need to call release_device_task, just release the task */
     gpu_device->data_avail_epoch++;
     return 0;
 }
