@@ -1730,7 +1730,8 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
                 if (cb->type == MPI_FUNNELLED_TYPE_SENDAM) {
                     tag = cb->cb_type.sendam.tag;
                     proc = cb->cb_type.sendam.remote;
-                } else if (cb->type == MPI_FUNNELLED_TYPE_ONESIDED_MIMIC_AM) {
+                } else if (cb->type == MPI_FUNNELLED_TYPE_ONESIDED_MIMIC_AM ||
+                           cb->type == MPI_FUNNELLED_TYPE_ONESIDED) {
                     tag = cb->onesided.tag;
                     proc = cb->onesided.remote;
                 }
@@ -1741,9 +1742,10 @@ mpi_no_thread_progress(parsec_comm_engine_t *ce)
             (void)type;
             assert(tag >= 0 && proc >= 0);
             DEBUG("COMPLETE %s rank %d proc %d tag %d\n", type, rank, proc, tag);
-            if (cb->type == MPI_FUNNELLED_TYPE_ONESIDED_MIMIC_AM) {
+            if ((cb->type == MPI_FUNNELLED_TYPE_ONESIDED_MIMIC_AM ||
+                 cb->type == MPI_FUNNELLED_TYPE_ONESIDED) && !cb->is_dynamic_recv) {
                 int cnt = --mpi_funnelled_num_send_req_in_arr;
-                DEBUG("COMPLETE MIMIC AM cnt %d\n", cnt);
+                DEBUG("COMPLETE SEND cnt %d\n", cnt);
                 assert(cnt >= 0);
             }
 
