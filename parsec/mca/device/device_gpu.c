@@ -3312,7 +3312,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
 {
     parsec_device_gpu_module_t* gpu_device = (parsec_device_gpu_module_t *)module;
     int rc, exec_stream = 0;
-    parsec_gpu_task_t *progress_task, *out_task_submit = NULL, *out_task_pop = NULL;
+    parsec_gpu_task_t *progress_task = NULL;
     parsec_gpu_task_t *gpu_task = (parsec_gpu_task_t*)_gpu_task;
 #if defined(PARSEC_DEBUG_NOISIER)
     char tmp[MAX_TASK_STRLEN];
@@ -3439,7 +3439,6 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         goto remove_gpu_task;
     }
     gpu_task = progress_task;
-    out_task_submit = progress_task;
 
   get_data_out_of_device:
     if( (NULL != gpu_task) && (PARSEC_GPU_TASK_TYPE_KERNEL == gpu_task->task_type) ) {
@@ -3469,7 +3468,6 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         goto complete_task;
     }
     gpu_task = progress_task;
-    out_task_pop = progress_task;
 
  fetch_task_from_shared_queue:
     assert( NULL == gpu_task );
