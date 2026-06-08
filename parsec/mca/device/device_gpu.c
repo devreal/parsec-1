@@ -4,6 +4,7 @@
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
  * Copyright (c) 2024      NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2026      Stony Brook University.  All rights reserved.
  */
 
 #include "parsec/parsec_config.h"
@@ -2714,11 +2715,21 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     }
     parsec_device_kernel_epilog( gpu_device, gpu_task );
 
+#if defined(PARSEC_DEBUG_PARANOID)
+    /**
+     * Batched submissions should have been split again for completion but
+     * in case this ever changes we will catch that here.
+     */
+    assert(parsec_gpu_task_is_singleton(gpu_task));
+#endif
     if (shift_completed_task(gpu_device, gpu_task)) {
         // ship the task to other threads to complete its execution
         gpu_task->ec->status = PARSEC_TASK_STATUS_COMPLETE;
         PARSEC_LIST_ITEM_SINGLETON(gpu_task->ec);
         __parsec_schedule(es, gpu_task->ec, 1);
+        PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream, "GPU[%d:%s]: task %p of gpu_task %p scheduled for completion",
+                             gpu_device->super.device_index, gpu_device->super.name,
+                             gpu_task->ec, gpu_task);
     } else {
         __parsec_complete_execution( es, gpu_task->ec );
     }
