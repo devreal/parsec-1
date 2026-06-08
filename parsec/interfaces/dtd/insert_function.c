@@ -2371,6 +2371,7 @@ int parsec_dtd_task_class_add_chore(parsec_taskpool_t *tp,
     }
 
     incarnations[i].type = device_type;
+    incarnations[i].flags = PARSEC_CHORE_FLAG_NONE;
     if(PARSEC_DEV_CUDA == device_type) {
         incarnations[i].hook = parsec_dtd_gpu_task_submit;
         dtd_tc->gpu_func_ptr = (parsec_advance_task_function_t)function;
