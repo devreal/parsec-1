@@ -150,7 +150,7 @@ build_flat_topology:
                 parsec_vpmap[i].threads[j].cpuset = HWLOC_ALLOC();
             }
             if( parsec_runtime_singlify_bindings > 0 )  /* late singlify */
-                hwloc_bitmap_singlify(parsec_vpmap[i].threads[j].cpuset);
+                HWLOC_SINGLIFY(parsec_vpmap[i].threads[j].cpuset);
             if( HWLOC_INTERSECTS(parsec_vpmap[i].cpuset, parsec_vpmap[i].threads[j].cpuset) ) {
                 /* overlap detected, show it to the user */
                 if(parsec_report_binding_issues) {
@@ -210,7 +210,11 @@ hwloc_cpuset_t parsec_vpmap_get_vp_thread_affinity(int vp, int thread, int *ht)
         (parsec_vpmap == NULL) ||
         (thread < 0) ||
         (thread >= parsec_vpmap[vp].nbthreads ) )
+#if defined(PARSEC_HAVE_HWLOC)
         return NULL;
+#else
+        return 0;
+#endif  /* defined(PARSEC_HAVE_HWLOC) */
     *ht = parsec_vpmap[vp].threads[thread].ht;
     return parsec_vpmap[vp].threads[thread].cpuset;
 }
@@ -406,7 +410,7 @@ int parsec_vpmap_init_from_flat(int nbthreads)
         parsec_vpmap[0].threads[id].nbcores = step;
         parsec_vpmap[0].threads[id].cpuset = HWLOC_ALLOC();
         parsec_vpmap[0].threads[id].ht = 0;
-        hwloc_bitmap_set_range(parsec_vpmap[0].threads[id].cpuset, id * step, (id+1) * step - 1);
+        HWLOC_SET_RANGE(parsec_vpmap[0].threads[id].cpuset, id * step, (id+1) * step - 1);
     }
     parsec_nb_total_threads = nbthreads;
     return PARSEC_SUCCESS;

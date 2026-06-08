@@ -28,6 +28,7 @@ BEGIN_C_DECLS
 #define HWLOC_FREE        hwloc_bitmap_free
 #define HWLOC_INTERSECTS  hwloc_bitmap_intersects
 #define HWLOC_OR          hwloc_bitmap_or
+#define HWLOC_SET_RANGE   hwloc_bitmap_set_range
 #else
 #define HWLOC_ASPRINTF    hwloc_cpuset_asprintf
 #define HWLOC_ISSET       hwloc_cpuset_isset
@@ -40,7 +41,22 @@ BEGIN_C_DECLS
 #define HWLOC_OR          hwloc_cpuset_or
 #define HWLOC_SINGLIFY hwloc_cpuset_singlify
 #define HWLOC_FREE     hwloc_cpuset_free
+#define HWLOC_SET_RANGE   hwloc_cpuset_set_range
 #endif  /* defined(PARSEC_HAVE_HWLOC_BITMAP) */
+#else  /* !defined(PARSEC_HAVE_HWLOC) */
+/* No-op stubs so code using these macros compiles without hwloc */
+#define HWLOC_ALLOC()         0
+#define HWLOC_FREE(b)         ((void)(b))
+#define HWLOC_DUP(b)          0
+#define HWLOC_ISSET(b,i)      0
+#define HWLOC_SET(b,i)        ((void)(0))
+#define HWLOC_FIRST(b)        (-1)
+#define HWLOC_WEIGHT(b)       0
+#define HWLOC_SINGLIFY(b)     ((void)(0))
+#define HWLOC_INTERSECTS(a,b) 0
+#define HWLOC_OR(d,s1,s2)     ((void)(0))
+#define HWLOC_ASPRINTF(s,b)   ((void)(*(s) = NULL))
+#define HWLOC_SET_RANGE(b,start,count)  ((void)(0))
 #endif  /* defined(PARSEC_HAVE_HWLOC) */
 
 /**
