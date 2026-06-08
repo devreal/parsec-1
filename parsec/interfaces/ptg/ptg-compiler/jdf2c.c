@@ -3954,6 +3954,7 @@ jdf_generate_function_incarnation_list( const jdf_t *jdf,
         }
         string_arena_add_string(sa, "#if defined(PARSEC_HAVE_DEV_%s_SUPPORT)\n", dev_upper);
         string_arena_add_string(sa, "    { .type     = PARSEC_DEV_%s,\n", dev_upper);
+        string_arena_add_string(sa, "      .flags    = PARSEC_CHORE_FLAG_NONE,\n");
         if( NULL == dyld_property ) {
             string_arena_add_string(sa, "      .dyld     = NULL,\n");
         } else {
@@ -3986,7 +3987,7 @@ jdf_generate_function_incarnation_list( const jdf_t *jdf,
     } while (NULL != body);
     string_arena_add_string(sa,
                             "    { .type     = PARSEC_DEV_NONE,\n"
-                            "      .evaluate = NULL,\n"
+                            "      .flags    = PARSEC_CHORE_FLAG_NONE,\n"
                             "      .hook     = (parsec_hook_t*)NULL },  /* End marker */\n"
                             "};\n\n");
 }
