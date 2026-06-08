@@ -2,7 +2,7 @@
  * Copyright (c) 2012-2024 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
- * Copyright (c) 2024      NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2024-2026 NVIDIA Corporation.  All rights reserved.
  */
 
 #if !defined(PARSEC_CONFIG_H_HAS_BEEN_INCLUDED)
@@ -40,15 +40,11 @@ BEGIN_C_DECLS
  * Arena-datatype management.
  */
 struct parsec_arena_datatype_s {
+    parsec_object_t           super;
     parsec_arena_t           *arena;       /**< allocator for this datatype */
     parsec_datatype_t         opaque_dtt;  /**< datatype */
     parsec_hash_table_item_t  ht_item;     /**< sometimes, arena datatype are stored in hash tables */
 };
-
-int parsec_arena_datatype_construct(parsec_arena_datatype_t *adt,
-                                   size_t elem_size,
-                                   size_t alignment,
-                                   parsec_datatype_t opaque_dtt);
 
 /* NULL terminated local hostname of the current PaRSEC process */
 PARSEC_DECLSPEC extern const char* parsec_hostname;
@@ -141,7 +137,7 @@ struct parsec_taskpool_s {
                                                     *   so on). Also, its value is increase by one for all the tasks
                                                     *   in the taskpool. This extra reference will be removed upon
                                                     *   completion of all tasks.
-                                                    *   WARNING: thiis field may only be modified through the
+                                                    *   WARNING: this field may only be modified through the
                                                     *   termination detection module API (tdm below). */
     parsec_context_t*           context;   /**< The PaRSEC context on which this taskpool was enqueued */
     parsec_termdet_monitor_t    tdm;       /**< Termination detection structures and pointer to module */
@@ -187,7 +183,7 @@ PARSEC_DECLSPEC PARSEC_OBJ_CLASS_DECLARATION(parsec_taskpool_t);
 #define PARSEC_DEPENDENCIES_FLAG_ALLOCATED  0x04
 
 /* When providing user-defined functions to count the number of tasks,
- * the user can return PARSEC_UNDETERMINED_NB_TASKS to say explicitely
+ * the user can return PARSEC_UNDETERMINED_NB_TASKS to say explicitly
  * that they will call the object termination function themselves.
  */
 #define PARSEC_UNDETERMINED_NB_TASKS (0x0fffffff)
@@ -200,6 +196,12 @@ PARSEC_DECLSPEC PARSEC_OBJ_CLASS_DECLARATION(parsec_taskpool_t);
 #define PARSEC_DEPENDENCIES_IN_DONE        ((parsec_dependency_t)(1<<30))
 #define PARSEC_DEPENDENCIES_STARTUP_TASK   ((parsec_dependency_t)(1<<29))
 #define PARSEC_DEPENDENCIES_BITMASK        (~(PARSEC_DEPENDENCIES_TASK_DONE|PARSEC_DEPENDENCIES_IN_DONE|PARSEC_DEPENDENCIES_STARTUP_TASK))
+
+/* Mask denoting if we can send and receive communication (e.g., MPI) directly into
+ * GPU buffers.
+ */
+#define PARSEC_RUNTIME_SEND_GPU_MEMORY 0x00000002
+#define PARSEC_RUNTIME_RECV_GPU_MEMORY 0x00000001
 
 /**
  * This structure is used internally by the parsec_dependencies_t structures
@@ -479,11 +481,13 @@ PARSEC_DECLSPEC extern size_t parsec_task_startup_chunk;
  * @brief Global configuration variable controlling the getrusage report.
  */
 PARSEC_DECLSPEC extern int parsec_want_rusage;
-/**
- * @brief Report issues with the bindings (such as overlapping bindings on
- *        processes located on the same physical node)
- */
-PARSEC_DECLSPEC extern int parsec_slow_bind_warning;
+PARSEC_DECLSPEC extern int parsec_runtime_ignore_bindings;
+PARSEC_DECLSPEC extern int parsec_runtime_allow_ht;
+/* Control the display of the thread bindings */
+PARSEC_DECLSPEC extern int parsec_report_bindings;
+PARSEC_DECLSPEC extern int parsec_report_binding_issues;
+PARSEC_DECLSPEC extern int parsec_runtime_singlify_bindings;
+
 /**
  * Global configuration variable controlling what tasks are given to the
  * scheduler. If this is enabled (the default) then the highest priority task
@@ -492,6 +496,12 @@ PARSEC_DECLSPEC extern int parsec_slow_bind_warning;
  * the scheduler, but can provide a better cache reuse.
  */
 PARSEC_DECLSPEC extern int parsec_runtime_keep_highest_priority_task;
+/**
+ * Global configuration mask allowing or not for the data to be sent or received,
+ * from or to, GPU memory. It can be an OR between PARSEC_RUNTIME_SEND_FROM_GPU_MEMORY
+ * and PARSEC_RUNTIME_RECV_FROM_GPU_MEMORY.
+ */
+PARSEC_DECLSPEC extern int parsec_mpi_allow_gpu_memory_communications;
 
 /**
  * Description of the state of the task. It indicates what will be the next

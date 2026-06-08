@@ -2,6 +2,7 @@
  * Copyright (c) 2009-2023 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
+ * Copyright (c) 2026      NVIDIA Corporation.  All rights reserved.
  */
 
 #ifndef PARSEC_RUNTIME_H_HAS_BEEN_INCLUDED
@@ -157,14 +158,17 @@ typedef enum parsec_hook_return_e {
  *
  * @details
  * Create a new execution context, using the number of resources passed
- * with the arguments. Every execution happend in the context of such an
- * execution context. Several contextes can cohexist on disjoint resources
- * in same time.
+ * with the arguments. Every execution happens in the context of such an
+ * execution context. Several contexts can coexist on disjoint resources
+ * at the same time.
  *
  * @param[in]    nb_cores the number of cores to use
  * @param[inout] pargc a pointer to the number of arguments passed in pargv
  * @param[inout] pargv an argv-like NULL terminated array of arguments to pass to
- *        the PaRSEC engine.
+ *        the PaRSEC engine. No entry is reserved for the application name; all
+ *        entries are treated as PaRSEC options. For compatibility with callers
+ *        passing a full main(argc, argv), or a slice starting with "--", a
+ *        leading non-option token or leading "--" separator is ignored.
  * @return the newly created PaRSEC context
  */
 parsec_context_t* parsec_init( int nb_cores, int* pargc, char** pargv[]);
@@ -241,7 +245,7 @@ void parsec_abort( parsec_context_t* pcontext, int status);
  *
  * @details
  * Complete all pending operations on the execution context, and release
- * all associated resources. Threads and acclerators attached to this
+ * all associated resources. Threads and accelerators attached to this
  * context will be released.
  *
  * @param[inout] pcontext a pointer to the PaRSEC context to finalize
@@ -250,7 +254,7 @@ void parsec_abort( parsec_context_t* pcontext, int status);
 int parsec_fini( parsec_context_t** pcontext );
 
 /**
- * Setup external finilize routine to be callback during parsec_fini
+ * Setup external finalize routine to be callback during parsec_fini
  */
 void parsec_context_at_fini(parsec_external_fini_cb_t cb, void *data);
 
@@ -260,7 +264,7 @@ void parsec_context_at_fini(parsec_external_fini_cb_t cb, void *data);
  * @details
  * Attach an execution taskpool on a context, in other words on the set of
  * resources associated to this particular context. A matching between
- * the capabilitis of the context and the support from the taskpool will be
+ * the capabilities of the context and the support from the taskpool will be
  * done during this step, which will basically define if accelerators can
  * be used for the execution.
  *

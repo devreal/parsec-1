@@ -3,11 +3,13 @@
  * Copyright (c) 2009-2021 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
+ * Copyright (c) 2026      NVIDIA Corporation.  All rights reserved.
  */
 
 #include "parsec/runtime.h"
 #include "parsec/data_distribution.h"
 #include "parsec/arena.h"
+#include "parsec/mca/device/device.h"
 
 #if defined(PARSEC_HAVE_MPI)
 #include <mpi.h>
@@ -17,6 +19,8 @@
 #include "rtt.h"
 #include "rtt_wrapper.h"
 
+extern int rtt_verbose;
+
 static void
 __parsec_rtt_taskpool_destructor(parsec_rtt_taskpool_t *rtt_tp)
 {
@@ -24,6 +28,7 @@ __parsec_rtt_taskpool_destructor(parsec_rtt_taskpool_t *rtt_tp)
      * so we need to clean up.
      */
     parsec_type_free( &(rtt_tp->arenas_datatypes[PARSEC_rtt_DEFAULT_ADT_IDX].opaque_dtt) );
+    PARSEC_OBJ_DESTRUCT(&rtt_tp->arenas_datatypes[PARSEC_rtt_DEFAULT_ADT_IDX]);
 }
 
 PARSEC_OBJ_CLASS_INSTANCE(parsec_rtt_taskpool_t, parsec_taskpool_t,
@@ -51,13 +56,14 @@ parsec_taskpool_t *rtt_new(parsec_data_collection_t *A, int size, int nb)
         return (parsec_taskpool_t*)tp;
     }
 
-    tp = parsec_rtt_new(A, nb, worldsize);
+    tp = parsec_rtt_new(A, nb, 1, worldsize);
+    parsec_mca_device_taskpool_restrict((parsec_taskpool_t*)tp, PARSEC_DEV_CPU);
 
     ptrdiff_t lb, extent;
     parsec_type_create_contiguous(size, parsec_datatype_uint8_t, &block);
     parsec_type_extent(block, &lb, &extent);
 
-    parsec_arena_datatype_construct( &tp->arenas_datatypes[PARSEC_rtt_DEFAULT_ADT_IDX],
+    parsec_arena_datatype_set_type( &tp->arenas_datatypes[PARSEC_rtt_DEFAULT_ADT_IDX],
                                      extent, PARSEC_ARENA_ALIGNMENT_SSE,
                                      block );
     return (parsec_taskpool_t*)tp;

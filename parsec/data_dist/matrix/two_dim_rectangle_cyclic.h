@@ -11,16 +11,10 @@
 
 BEGIN_C_DECLS
 
-/*
- * General distribution of data. Suppose exists a matrix in process of mpi rank 0
- */
-
 /*******************************************************************
  * distributed data structure and basic functionalities
  *******************************************************************/
 
-/* structure equivalent to PLASMA_desc, but for distributed matrix data
- */
 typedef struct parsec_matrix_block_cyclic {
     parsec_tiled_matrix_t super;
     parsec_grid_2Dcyclic_t   grid;
@@ -45,7 +39,6 @@ typedef struct parsec_matrix_block_cyclic {
  * @param dc matrix description structure, already allocated, that will be initialize
  * @param mtype type of data used for this matrix
  * @param storage type of storage of data
- * @param nodes number of nodes
  * @param myrank rank of the local node (as of mpi rank)
  * @param mb number of row in a tile
  * @param nb number of column in a tile
@@ -54,7 +47,7 @@ typedef struct parsec_matrix_block_cyclic {
  * @param i starting row index for the computation on a submatrix
  * @param j starting column index for the computation on a submatrix
  * @param m number of rows of the entire submatrix
- * @param n numbr of column of the entire submatrix
+ * @param n number of columns of the entire submatrix
  * @param p number of row of processes of the process grid the
  *   resulting distribution will be made so that pxq=nodes
  * @param q number of col of processes of the process grid the

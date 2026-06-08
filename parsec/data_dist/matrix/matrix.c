@@ -2,6 +2,7 @@
  * Copyright (c) 2010-2024 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
+ * Copyright (c) 2026      NVIDIA Corporation.  All rights reserved.
  */
 /************************************************************
  *distributed matrix generation
@@ -15,6 +16,7 @@
 #include "parsec/data_dist/matrix/matrix.h"
 #include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
 #include "parsec/data_dist/matrix/sym_two_dim_rectangle_cyclic.h"
+#include "parsec/data_dist/matrix/sbc.h"
 #include "parsec/data_dist/matrix/two_dim_tabular.h"
 
 #if defined(PARSEC_HAVE_MPI)
@@ -132,7 +134,7 @@ void parsec_tiled_matrix_init( parsec_tiled_matrix_t *tdesc,
         o->key_dim = NULL;
     }
 
-    /* Define the default datatye of the datacollection */
+    /* Define the default datatype of the datacollection */
     parsec_datatype_t elem_dt = PARSEC_DATATYPE_NULL;
     ptrdiff_t extent;
     parsec_translate_matrix_type( tdesc->mtype, &elem_dt );
@@ -188,6 +190,10 @@ parsec_tiled_matrix_submatrix( parsec_tiled_matrix_t *tdesc,
     else if( tdesc->dtype & parsec_matrix_sym_block_cyclic_type ) {
         newdesc = (parsec_tiled_matrix_t*) malloc ( sizeof(parsec_matrix_sym_block_cyclic_t) );
         memcpy( newdesc, tdesc, sizeof(parsec_matrix_sym_block_cyclic_t) );
+    }
+    else if( tdesc->dtype & parsec_matrix_sbc_type ) {
+        newdesc = (parsec_tiled_matrix_t*) malloc ( sizeof(parsec_matrix_sbc_t) );
+        memcpy( newdesc, tdesc, sizeof(parsec_matrix_sbc_t) );
     }
     else if( tdesc->dtype & parsec_matrix_tabular_type ) {
         newdesc = (parsec_tiled_matrix_t*) malloc ( sizeof(parsec_matrix_tabular_t) );

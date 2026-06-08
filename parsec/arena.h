@@ -71,9 +71,9 @@ struct parsec_arena_chunk_s {
      *  This chunk is chained when it resides inside an arena's free list
      *  It is SINGLETON when ( (not in a free list) and (in debug mode) ) */
     parsec_list_item_t item;
-    uint32_t           count;    /**< Number of basic elements pointed by param in this chunck */
-    parsec_arena_t    *origin;   /**< Arena in which this chunck should be released */
-    void              *data;     /**< Actual data pointed by this chunck */
+    uint32_t           count;    /**< Number of basic elements pointed by param in this chunk */
+    parsec_arena_t    *origin;   /**< Arena in which this chunk should be released */
+    void              *data;     /**< Actual data pointed by this chunk */
 };
 
 /* for SSE, 16 is mandatory, most cache are 64 bit aligned */
@@ -133,22 +133,22 @@ int parsec_arena_construct_ex(parsec_arena_t* arena,
  *   enough resource to allocate a new data copy of this type.
  */
 
-parsec_data_copy_t *parsec_arena_get_copy(parsec_arena_t *arena,
-                                          size_t count, int device,
-                                          parsec_datatype_t dtt);
+parsec_data_copy_t *parsec_arena_get_new_copy(parsec_arena_t *arena,
+                                              size_t count, int device,
+                                              parsec_datatype_t dtt);
 
 /**
  * @brief Allocates memory for a given data copy. This is a function used by
  *  DSLs to set the memory associated with a data copy they have created.
- *  It is also used by parsec_arena_get_copy.
- * 
+ *  It is also used by parsec_arena_get_new_copy.
+ *
  * @param copy the (empty) data copy to allocate memory for. NB: the @p original
  *  field of this data copy must be set. The operation overwrites the device
  *  dtt and count of this data copy, as well as the device_private pointer.
  * @param arena the arena used for the allocation
  * @param count the number of elements to allocate
  * @param device the device of the data copy. Note: the current implementation
- *   of arenas only work for CPU mmeory, and that device must be a CPU device.
+ *   of arenas only work for CPU memory, and that device must be a CPU device.
  * @param dtt the datatype associated with each element of the memory allocated
  * @return int PARSEC_SUCCESS in case of success, or an error code if there
  *   was not enough resource to satisfy the allocation request.
@@ -165,4 +165,3 @@ END_C_DECLS
 /** @} */
 
 #endif /* __USE_ARENA_H__ */
-

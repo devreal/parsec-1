@@ -152,7 +152,7 @@ static parsec_data_t* sym_twoDBC_data_of(parsec_data_collection_t *desc, ...)
 
     position = parsec_matrix_sym_block_cyclic_coord2pos(dc, m, n);
 
-    /* If mat allocatd, set pos to the right position for each tile */
+    /* If mat allocated, set pos to the right position for each tile */
     if( NULL != dc->mat )
         pos = position;
 
@@ -177,7 +177,7 @@ static int32_t sym_twoDBC_vpid_of(parsec_data_collection_t *desc, ...)
     int32_t vpid;
     dc = (parsec_matrix_sym_block_cyclic_t *)desc;
 
-    pq = vpmap_get_nb_vp();
+    pq = parsec_vpmap_get_nb_vp();
     if ( pq == 1 )
         return 0;
 
@@ -214,7 +214,7 @@ static int32_t sym_twoDBC_vpid_of(parsec_data_collection_t *desc, ...)
     assert( (n % dc->grid.cols) == dc->grid.crank );
 
     vpid = (local_n % q) * p + (local_m % p);
-    assert( vpid < vpmap_get_nb_vp() );
+    assert( vpid < parsec_vpmap_get_nb_vp() );
     return vpid;
 }
 
@@ -350,4 +350,3 @@ size_t parsec_matrix_sym_block_cyclic_coord2pos(
     }
     return pos;
 }
-

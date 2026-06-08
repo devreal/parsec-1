@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2021-2024 The University of Tennessee and The University
+ * Copyright (c) 2021-2025 The University of Tennessee and The University
  *                         of Tennessee Research Foundation.  All rights
  *                         reserved.
- * Copyright (c) 2024      NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2024-2026 NVIDIA Corporation.  All rights reserved.
  */
 
 #ifndef PARSEC_DEVICE_GPU_H
@@ -50,6 +50,19 @@ typedef int (*parsec_advance_task_function_t)(parsec_device_gpu_module_t  *gpu_d
                                               parsec_gpu_task_t           *gpu_task,
                                               parsec_gpu_exec_stream_t    *gpu_stream);
 
+/* Callback used by parsec_gpu_task_collect_batch() to decide whether a
+ * pending task can be appended to the current batched task ring.
+ *
+ * Return values:
+ *   < 0: stop iteration and return this error code to the caller.
+ *     0: extract candidate from the stream pending queue and append it to
+ *        batch_head.
+ *   > 0: leave candidate in the stream pending queue and continue.
+ */
+typedef int (*parsec_gpu_task_batch_cb_t)(parsec_gpu_task_t *candidate,
+                                          parsec_gpu_task_t *batch_head,
+                                          void *callback_data);
+
 /* Function type to transfer data to the GPU device.
  * Transfer transfer the <count> contiguous bytes from
  * task->data[i].data_in to task->data[i].data_out.
@@ -66,7 +79,7 @@ typedef int (parsec_stage_in_function_t)(parsec_gpu_task_t        *gtask,
 
 /* Function type to transfer data from the GPU device.
  * Transfer transfer the <count> contiguous bytes from
- * task->data[i].data_in to task->data[i].data_out.
+ * task->data[i].data_out to the copy on device 0.
  *
  * @param[in] task parsec_task_t containing task->data[i].data_in, task->data[i].data_out.
  * @param[in] flow_mask indicating task flows for which to transfer.
@@ -81,7 +94,25 @@ typedef int (parsec_stage_out_function_t)(parsec_gpu_task_t        *gtask,
  * and this function allows the device engine to delegate the release of such tasks back into
  * the DSL. Once this task called, the device task should not be accessed by the device.
  */
-typedef void (*parsec_release_device_task_function_t)(void*);
+typedef void (*parsec_release_device_task_function_t)(parsec_gpu_task_t*);
+typedef struct parsec_gpu_flow_info_s {
+    const parsec_flow_t      *flow;         /* Some DSL might not have a task_class, but they still need to provide a flow. */
+    size_t                    flow_span;    /* the span of the data on the device. For contiguous layout this is equal to the
+                                             * size of the data, for all the other copies this should be the amount of memory
+                                             * needed on the device.
+                                             */
+    parsec_data_collection_t *flow_dc; /* the data collection from which the data originates. When the data copy is local, the data
+                                        * collection can be accessed via the data_t, but for all copies coming from the network there
+                                        * is no known data collection. Thus, for such cases the DSL need to provide a reference to the
+                                        * local data collection to be used for all transfers. This data collection is needed to get
+                                        * access to the mtype, to get the memory layout of the copy.
+                                        */
+    /* The is private to the device code and should not be used outside the device driver */
+    parsec_data_copy_t       *source; /* If the driver decides to acquire the data from a different
+                                        * source, it will temporary store the best candidate here.
+                                        */
+
+} parsec_gpu_flow_info_t;
 
 struct parsec_gpu_task_s {
     parsec_list_item_t                     list_item;
@@ -102,29 +133,28 @@ struct parsec_gpu_task_s {
         struct {
             parsec_task_t                 *ec;
             uint64_t                       last_data_check_epoch;
-            const parsec_flow_t           *flow[MAX_PARAM_COUNT];  /* There is no consistent way to access the flows from the task_class,
-                                                                    * so the DSL need to provide these flows here.
-                                                                    */
-            size_t                         flow_nb_elts[MAX_PARAM_COUNT]; /* for each flow, size of the data to be allocated
-                                                                           * on the GPU.
-                                                                           */
-            parsec_data_collection_t      *flow_dc[MAX_PARAM_COUNT];     /* for each flow, data collection from which the data
-                                                                          * to be transferred logically belongs to.
-                                                                          * This gives the user the chance to indicate on the JDF
-                                                                          * a data collection to inspect during GPU transfer.
-                                                                          * User may want info from the DC (e.g. mtype),
-                                                                          * & otherwise remote copies don't have any info.
-                                                                          */
-            /* These are private and should not be used outside the device driver */
-            parsec_data_copy_t            *sources[MAX_PARAM_COUNT];  /* If the driver decides to acquire the data from a different
-                                                                       * source, it will temporary store the best candidate here.
-                                                                       */
+            uint32_t                       nb_flows;
+            parsec_gpu_flow_info_t        *flow_info;
         };
         struct {
             parsec_data_copy_t            *copy;
         };
     };
 };
+
+PARSEC_DECLSPEC PARSEC_OBJ_CLASS_DECLARATION(parsec_gpu_task_t);
+
+/**
+ * Specialized GPU tasks for the PTG and DTD DSL. The maximum number of flows being MAX_PARAM_COUNT we
+ * can make the gpu_flow_info array part of the struct, to allocate the gpu_task as a single,
+ * contiguous block of memory.
+ */
+typedef struct parsec_gpu_dsl_task_s {
+    parsec_gpu_task_t                      super;
+    parsec_gpu_flow_info_t                 flows[MAX_PARAM_COUNT];  /* All the flow info necessary for the PTG and DTD DSL */
+} parsec_gpu_dsl_task_t;
+
+PARSEC_DECLSPEC PARSEC_OBJ_CLASS_DECLARATION(parsec_gpu_dsl_task_t);
 
 typedef enum parsec_device_transfer_direction_e {
     parsec_device_gpu_transfer_direction_h2d,
@@ -182,7 +212,7 @@ typedef int (*parsec_device_event_query_fn_t)(struct parsec_device_gpu_module_s 
  * 
  * @details typically maps to cudaMemGetInfo or equivalent. 
  * 
- * @return PARSEC_SUCCESS if succesfull, a PARSEC error otherwise (in which case the parameters are undefined)
+ * @return PARSEC_SUCCESS if successful, a PARSEC error otherwise (in which case the parameters are undefined)
  */
 typedef int (*parsec_device_memory_info_fn_t)(struct parsec_device_gpu_module_s *gpu, size_t *free_mem, size_t *total_mem);
 
@@ -191,7 +221,7 @@ typedef int (*parsec_device_memory_info_fn_t)(struct parsec_device_gpu_module_s 
  * 
  * @details typically maps to cudaMalloc or equivalent. 
  * 
- * @return PARSEC_SUCCESS if succesfull, a PARSEC error otherwise (in which case @p addr is undefined)
+ * @return PARSEC_SUCCESS if successful, a PARSEC error otherwise (in which case @p addr is undefined)
  */
 typedef int (*parsec_device_memory_allocate_fn_t)(struct parsec_device_gpu_module_s *gpu, size_t bytes, void **addr);
 
@@ -200,7 +230,7 @@ typedef int (*parsec_device_memory_allocate_fn_t)(struct parsec_device_gpu_modul
  * 
  * @details typically maps to cudaFree or equivalent. 
  * 
- * @return PARSEC_SUCCESS if succesfull, a PARSEC error otherwise
+ * @return PARSEC_SUCCESS if successful, a PARSEC error otherwise
  */
 typedef int (*parsec_device_memory_free_fn_t)(struct parsec_device_gpu_module_s *gpu, void *addr);
 
@@ -320,6 +350,29 @@ parsec_gpu_task_t* parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_de
                                                size_t required_size, size_t *selected_size);
 int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_gpu_task_t *w2r_task, parsec_execution_stream_t *es);
 
+/**
+ * Iterate over gpu_stream->fifo_pending and append accepted tasks to
+ * batch_head. The callback receives each pending candidate, the task passed to
+ * the submit function, and user data. The callback should return 0 to append
+ * the candidate to batch_head's ring, a positive value to leave it pending, or
+ * a negative error code to stop the iteration.
+ * The callback must not modify gpu_stream->fifo_pending directly.
+ * If batching is disabled, unsupported by the head task's selected device, or
+ * not enabled on batch_head's selected incarnation, no iteration is performed
+ * and batch_head remains a singleton. Pending tasks whose selected incarnation
+ * does not support batching on that same selected device are skipped without
+ * calling the callback.
+ *
+ * Returns the number of additional tasks appended to batch_head's ring on
+ * success, or the negative callback error code. If an error is returned, tasks
+ * already accepted remain attached to batch_head and the remaining candidates
+ * stay in fifo_pending.
+ */
+int parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
+                                  parsec_gpu_task_t *batch_head,
+                                  parsec_gpu_task_batch_cb_t callback,
+                                  void *callback_data);
+
 void parsec_device_enable_debug(void);
 
 #if defined(PARSEC_DEBUG_VERBOSE)
@@ -332,6 +385,7 @@ char *parsec_device_describe_gpu_task( char *tmp, size_t len, parsec_gpu_task_t 
 #define PARSEC_GPU_TASK_TYPE_PREFETCH              0x2000
 #define PARSEC_GPU_TASK_TYPE_WARMUP                0x4000
 #define PARSEC_GPU_TASK_TYPE_D2D_COMPLETE          0x8000
+#define PARSEC_GPU_TASK_TYPE_INVALID               0xf000
 
 #if defined(PARSEC_PROF_TRACE)
 #define PARSEC_PROFILE_GPU_TRACK_DATA_IN  0x0001

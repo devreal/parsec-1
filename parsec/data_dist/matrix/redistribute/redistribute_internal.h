@@ -6,6 +6,7 @@
 #include "parsec.h"
 #include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
 #include "parsec/data_dist/matrix/two_dim_tabular.h"
+#include "parsec/data_dist/matrix/sbc.h"
 #include "parsec/data_dist/matrix/matrix.h"
 #include "parsec/datatype.h"
 #include "parsec/arena.h"
@@ -74,6 +75,79 @@ getsize(const int index, const int index_start, const int index_end,
     return mb;
 }
 
+static inline int
+redistribute_distribution_num_cols(parsec_tiled_matrix_t *dc, int size_col)
+{
+    if( dc->dtype & parsec_matrix_tabular_type ) {
+        int tile_cols = (int)ceil((double)size_col / (double)dc->nb);
+        return (tile_cols <= (int)dc->super.nodes) ? tile_cols : (int)dc->super.nodes;
+    }
+    if( dc->dtype & parsec_matrix_block_cyclic_type ) {
+        parsec_matrix_block_cyclic_t *bc = (parsec_matrix_block_cyclic_t *)dc;
+        return bc->grid.cols * bc->grid.kcols;
+    }
+    if( dc->dtype & parsec_matrix_sbc_type ) {
+        parsec_matrix_sbc_t *sbc = (parsec_matrix_sbc_t *)dc;
+        return sbc->r;
+    }
+
+    return -1;
+}
+
+static inline int
+redistribute_pair_num_cols(parsec_tiled_matrix_t *dcY,
+                           parsec_tiled_matrix_t *dcT,
+                           int size_col)
+{
+    int num_col_Y = redistribute_distribution_num_cols(dcY, size_col);
+    int num_col_T = redistribute_distribution_num_cols(dcT, size_col);
+
+    if( (num_col_Y <= 0) || (num_col_T <= 0) ) {
+        return -1;
+    }
+
+    if( (dcY->dtype & parsec_matrix_tabular_type) &&
+        (dcT->dtype & parsec_matrix_tabular_type) ) {
+        return num_col_Y;
+    }
+    if( dcY->dtype & parsec_matrix_tabular_type ) {
+        return num_col_T;
+    }
+    if( dcT->dtype & parsec_matrix_tabular_type ) {
+        return num_col_Y;
+    }
+
+    return (num_col_Y >= num_col_T) ? num_col_Y : num_col_T;
+}
+
+static inline int
+redistribute_region_is_stored(parsec_tiled_matrix_t *dc,
+                              int size_row, int size_col,
+                              int disi, int disj)
+{
+    parsec_matrix_sbc_t *sbc;
+    int m_start, m_end, n_start, n_end;
+
+    if( !(dc->dtype & parsec_matrix_sbc_type) ) {
+        return 1;
+    }
+
+    sbc = (parsec_matrix_sbc_t *)dc;
+    m_start = disi / dc->mb;
+    m_end = (disi + size_row - 1) / dc->mb;
+    n_start = disj / dc->nb;
+    n_end = (disj + size_col - 1) / dc->nb;
+
+    if( PARSEC_MATRIX_LOWER == sbc->uplo ) {
+        return m_start >= n_end;
+    }
+    if( PARSEC_MATRIX_UPPER == sbc->uplo ) {
+        return n_start >= m_end;
+    }
+
+    return 0;
+}
+
 /**
  * @brief CORE function, used in parsec_redistribute_dtd
  *
@@ -96,8 +170,8 @@ getsize(const int index, const int index_start, const int index_end,
  * @param [in] j_end: column end index of submatrix
  * @param [in] mb_T_inner: row size, not including ghost region
  * @param [in] R: radius of ghost region
- * @param [in] i_start_T: row displacememnt in T
- * @param [in] j_start_T: column displacememnt in T
+ * @param [in] i_start_T: row displacement in T
+ * @param [in] j_start_T: column displacement in T
  */
 void CORE_redistribute_dtd(DTYPE* T, DTYPE* Y, int mb_Y, int nb_Y, int m_Y, int n_Y,
                            int m_Y_start, int m_Y_end, int n_Y_start, int n_Y_end,
@@ -120,4 +194,3 @@ CORE_redistribute_reshuffle_copy(DTYPE *T, DTYPE *Y, const int mb,
 {
     MOVE_SUBMATRIX(mb, nb, Y, 0, 0, Y_LDA, T, 0, 0, T_LDA);
 }
-
