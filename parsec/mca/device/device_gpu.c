@@ -3478,8 +3478,8 @@ parsec_device_kernel_cleanout( parsec_device_gpu_module_t *gpu_device,
  */
 static bool gpu_device_exec_streams_fifo_empty( parsec_device_gpu_module_t *gpu_device )
 {
-    for (int i = 2; i < gpu_device->nb_exec_streams; i++) {
-        if( !parsec_list_nolock_is_empty(gpu_device->exec_streams[i].fifo_pending) ) {
+    for (int i = 2; i < gpu_device->num_exec_streams; i++) {
+        if( !parsec_list_nolock_is_empty(gpu_device->exec_stream[i].fifo_pending) ) {
             return false;
         }
     }
