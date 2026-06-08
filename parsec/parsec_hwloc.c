@@ -25,9 +25,9 @@
 static hwloc_topology_t parsec_hwloc_loaded_topology;
 static hwloc_topology_t parsec_hwloc_restricted_topology;
 static int parsec_hwloc_first_init = 1;
+static int parsec_available_binding_resources = 1;
 #endif  /* defined(PARSEC_HAVE_HWLOC) */
 static int hyperth_per_core = 1;
-static int parsec_available_binding_resources = 1;
 
 #if defined(PARSEC_HAVE_HWLOC_PARENT_MEMBER)
 #define HWLOC_GET_PARENT(OBJ)  (OBJ)->parent
@@ -59,19 +59,19 @@ char* parsec_hwloc_convert_cpuset(int convert_to_system, hwloc_cpuset_t cpuset)
         hwloc_cpuset_t binding_mask;
         binding_mask = parsec_hwloc_cpuset_convert_to_system(cpuset);
         HWLOC_ASPRINTF(&str, binding_mask);
-        hwloc_bitmap_free(binding_mask);
+        HWLOC_FREE(binding_mask);
     } else {
         HWLOC_ASPRINTF(&str, cpuset);
     }
     return str;
 }
 
+#if defined(PARSEC_HAVE_HWLOC)
 /**
  * Print the cpuset as a string prefaced with the provided message.
  */
 static void parsec_hwloc_print_cpuset(int verb, int convert_to_system, char* msg, hwloc_cpuset_t cpuset)
 {
-#if defined(PARSEC_HAVE_HWLOC)
     char *str = NULL;
 
     str = parsec_hwloc_convert_cpuset(convert_to_system, cpuset);
@@ -80,11 +80,8 @@ static void parsec_hwloc_print_cpuset(int verb, int convert_to_system, char* msg
     else if( 2 == verb ) parsec_inform("%s %s", msg, str);
     else parsec_debug_verbose(verb, parsec_debug_output, "%s %s", msg, str);
     free(str);
-#else
-    (void)cpuset;(void)verb;
-    parsec_debug_verbose(3, parsec_debug_output, "%s compiled without HWLOC support", msg);
-#endif  /* defined(PARSEC_HAVE_HWLOC) */
 }
+#endif  /* defined(PARSEC_HAVE_HWLOC) */
 
 int parsec_hwloc_init(void)
 {
@@ -383,9 +380,14 @@ unsigned int parsec_hwloc_nb_cores_per_obj( int level, int index )
 
 hwloc_cpuset_t parsec_hwloc_cpuset_per_obj(int level, int index)
 {
+#if defined(PARSEC_HAVE_HWLOC)
     hwloc_obj_t obj = hwloc_get_obj_by_depth(parsec_hwloc_loaded_topology, level, index);
     if(NULL == obj) return NULL;
     return HWLOC_DUP(obj->cpuset);
+#else
+    (void)level; (void)index;
+    return 0;
+#endif  /* defined(PARSEC_HAVE_HWLOC) */
 }
 
 int parsec_hwloc_nb_levels(void)
@@ -421,6 +423,9 @@ char *parsec_hwloc_get_binding(hwloc_cpuset_t* cpuset, int flag)
     }
     return binding;
 #else
+    // unused
+    (void)cpuset;
+    (void)flag;
     return NULL;
 #endif
 }
@@ -482,6 +487,7 @@ int parsec_hwloc_bind_on_core_index(int cpu_index, int local_ht_index)
 
 hwloc_cpuset_t parsec_hwloc_cpuset_convert_to_system(hwloc_cpuset_t cpuset)
 {
+#if defined(PARSEC_HAVE_HWLOC)
     unsigned cpu_index;
     hwloc_obj_t obj;
     hwloc_cpuset_t binding_mask;
@@ -505,6 +511,9 @@ hwloc_cpuset_t parsec_hwloc_cpuset_convert_to_system(hwloc_cpuset_t cpuset)
     } hwloc_bitmap_foreach_end();
 
     return binding_mask;
+#else
+    return cpuset;
+#endif  /* defined(PARSEC_HAVE_HWLOC) */
 }
 int parsec_hwloc_bind_on_mask_index(hwloc_cpuset_t cpuset)
 {

@@ -763,18 +763,20 @@ parsec_context_t* parsec_init( int nb_cores, int* pargc, char** pargv[] )
     /* Introduce communication engine */
     (void)parsec_remote_dep_init(context);
 
+#if defined(PARSEC_HAVE_HWLOC)
     if( parsec_report_bindings) {
         char *str;
-        hwloc_bitmap_asprintf(&str, context->cpuset_allowed_mask);
+        HWLOC_ASPRINTF(&str, context->cpuset_allowed_mask);
         parsec_inform("Process binding [rank %d]: cpuset [ALLOWED  ]: %s\n", context->my_rank, str);
         free(str);
-        hwloc_bitmap_asprintf(&str, context->cpuset_used_mask);
+        HWLOC_ASPRINTF(&str, context->cpuset_used_mask);
         parsec_inform("Process binding [rank %d]: cpuset [USED     ]: %s\n", context->my_rank, str);
         free(str);
-        hwloc_bitmap_asprintf(&str, context->cpuset_free_mask);
+        HWLOC_ASPRINTF(&str, context->cpuset_free_mask);
         parsec_inform("Process binding [rank %d]: cpuset [FREE     ]: %s\n", context->my_rank, str);
         free(str);
     }
+#endif  /* defined(PARSEC_HAVE_HWLOC) */
 
     /* print a warning if multiple ranks share the same PU/cores
      * note we do it only once during init, we don't recheck during
