@@ -3984,7 +3984,10 @@ jdf_generate_function_incarnation_list( const jdf_t *jdf,
         else
             string_arena_add_string(sa, "      .evaluate = (parsec_evaluate_function_t*)%s,\n",
                                     (NULL == evaluate_property) ? "NULL" : evaluate_property->expr->jdf_c_code.fname);
-        string_arena_add_string(sa, "      .hook     = (parsec_hook_t*)hook_of_%s_%s },\n", base_name, dev_upper);
+        if( NULL == type_property )
+            string_arena_add_string(sa, "      .hook     = (parsec_hook_t*)hook_of_%s },\n", base_name);
+        else
+            string_arena_add_string(sa, "      .hook     = (parsec_hook_t*)hook_of_%s_%s },\n", base_name, dev_upper);
         string_arena_add_string(sa, "#endif  /* defined(PARSEC_HAVE_DEV_%s_SUPPORT) */\n", dev_upper);
         free(dev_upper);
         body = body->next;
