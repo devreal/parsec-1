@@ -2918,8 +2918,13 @@ parsec_device_kernel_exec( parsec_device_gpu_module_t      *gpu_device,
     /* The submit hook may turn gpu_task into a batch ring. Start from a clean
      * singleton so stale list links left by release-mode list operations cannot
      * be mistaken for a preexisting ring.
+     * However, if the task returned PARSEC_HOOK_RETURN_AGAIN, we must preserve the
+     * ring as it may contain the follower tasks of the batch.
      */
-    PARSEC_LIST_ITEM_SINGLETON(&gpu_task->list_item);
+    if (gpu_task->last_status != PARSEC_HOOK_RETURN_AGAIN) {
+        /* The task is being rescheduled, we need to reset the status */
+        PARSEC_LIST_ITEM_SINGLETON(&gpu_task->list_item);
+    }
 
     (void)this_task;
     rc = progress_fct( gpu_device, gpu_task, gpu_stream );
