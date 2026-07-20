@@ -2128,6 +2128,21 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
                                      "GPU[%d:%s]: GPU task %p[%p] is ready to be rescheduled on the same GPU device and same stream",
                                      gpu_device->super.device_index, gpu_device->super.name, (void*)task, (void*)task->ec);
                 *out_task = NULL;
+#if 0
+                if (!parsec_gpu_task_is_singleton(task)) {
+                    /**
+                     * Batched tasks need to be returned to the pending queue. We can take the first
+                     * task in the ring and schedule it right away.
+                     * The follower tasks in the ring inherit the return status of the leader task.
+                     */
+                    parsec_gpu_task_t *cur = task;
+                    while ((cur = (parsec_gpu_task_t*)cur->list_item.list_next) != task) {
+                        cur->last_status = task->last_status;
+                    }
+                    parsec_list_chain_front(stream->fifo_pending, &task->list_item);
+                    task = (parsec_gpu_task_t*) parsec_list_pop_front(stream->fifo_pending);
+                }
+#endif
                 goto schedule_task;
             }
             assert( PARSEC_HOOK_RETURN_ASYNC != task->last_status );
@@ -2360,8 +2375,13 @@ parsec_device_kernel_exec( parsec_device_gpu_module_t      *gpu_device,
     /* The submit hook may turn gpu_task into a batch ring. Start from a clean
      * singleton so stale list links left by release-mode list operations cannot
      * be mistaken for a preexisting ring.
+     * However, if the task returned PARSEC_HOOK_RETURN_AGAIN, we must preserve the
+     * ring as it may contain the follower tasks of the batch.
      */
-    PARSEC_LIST_ITEM_SINGLETON(&gpu_task->list_item);
+    if (gpu_task->last_status != PARSEC_HOOK_RETURN_AGAIN) {
+        /* The task is being rescheduled, we need to reset the status */
+        PARSEC_LIST_ITEM_SINGLETON(&gpu_task->list_item);
+    }
 
     (void)this_task;
     return progress_fct( gpu_device, gpu_task, gpu_stream );
