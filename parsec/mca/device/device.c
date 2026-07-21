@@ -530,7 +530,7 @@ void parsec_devices_print_statistics(parsec_context_t *parsec_context, uint64_t 
         if( NULL == (device = parsec_devices[i]) ) continue;
         assert( i == device->device_index );
         total_tasks        += executed_tasks[i];
-        total_data_in      += transferred_in[i] + transferred_d2d[i];
+        total_data_in      += transferred_in[i];
         total_data_out     += transferred_out[i];
         total_required_in  += required_in[i];
         total_required_out += required_out[i];
