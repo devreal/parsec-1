@@ -1253,9 +1253,30 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
     return PARSEC_HOOK_RETURN_DONE;
 }
 
+/**
+ * @brief Generic fallback for parsec_device_memcpy_multi_async_fn_t: issues @p nb_items
+ *    individual gpu->memcpy_async() calls. Does not stop at the first failure -- every
+ *    item is attempted regardless, and the first error encountered (if any) is returned.
+ *    Used by backends that do not (yet) provide a native batched copy primitive.
+ */
+int
+parsec_device_generic_memcpy_multi_async(parsec_device_gpu_module_t *gpu, parsec_gpu_exec_stream_t *gpu_stream,
+                                         void **dsts, void **srcs, size_t *sizes,
+                                         parsec_device_transfer_direction_t *directions, int nb_items)
+{
+    int ret, rc = PARSEC_SUCCESS;
+
+    for(int i = 0; i < nb_items; i++) {
+        ret = gpu->memcpy_async(gpu, gpu_stream, dsts[i], srcs[i], sizes[i], directions[i]);
+        if( (PARSEC_SUCCESS == rc) && (PARSEC_SUCCESS != ret) )
+            rc = ret;
+    }
+    return rc;
+}
+
 /* Default stage_in function to transfer data to the GPU device.
- * Transfer transfer the <count> contiguous bytes from
- * task->data[i].data_in to task->data[i].data_out.
+ * Transfer the <count> contiguous bytes for every flow set in flow_mask from
+ * task->data[i].data_in to task->data[i].data_out, as a single multi-item transfer.
  *
  * @param[in] task parsec_task_t containing task->data[i].data_in, task->data[i].data_out.
  * @param[in] flow_mask indicating task flows for which to transfer.
@@ -1267,14 +1288,18 @@ parsec_default_gpu_stage_in(parsec_gpu_task_t        *gtask,
                             uint32_t                  flow_mask,
                             parsec_gpu_exec_stream_t *gpu_stream)
 {
-    int ret;
+    int ret, nb_items = 0;
     parsec_data_copy_t * source;
     parsec_data_copy_t * dest;
     parsec_device_gpu_module_t *src_dev;
-    parsec_device_gpu_module_t *dst_dev;
+    parsec_device_gpu_module_t *dst_dev = NULL;
     parsec_task_t *task = gtask->ec;
     size_t count;
     parsec_device_transfer_direction_t dir;
+    void *dsts[MAX_PARAM_COUNT];
+    void *srcs[MAX_PARAM_COUNT];
+    size_t sizes[MAX_PARAM_COUNT];
+    parsec_device_transfer_direction_t directions[MAX_PARAM_COUNT];
 
     for(int i = 0; i < task->task_class->nb_flows; i++) {
         if( !(flow_mask & (1U << i)) ) continue;
@@ -1293,20 +1318,24 @@ parsec_default_gpu_stage_in(parsec_gpu_task_t        *gtask,
 
         count = (source->original->nb_elts <= dest->original->nb_elts) ?
             source->original->nb_elts : dest->original->nb_elts;
-        ret = dst_dev->memcpy_async( dst_dev, gpu_stream,
-                                     dest->device_private,
-                                     source->device_private,
-                                     count,
-                                     dir );
-        if(PARSEC_SUCCESS != ret)
-            return PARSEC_HOOK_RETURN_ERROR;
+        assert(nb_items < MAX_PARAM_COUNT);
+        dsts[nb_items]       = dest->device_private;
+        srcs[nb_items]       = source->device_private;
+        sizes[nb_items]      = count;
+        directions[nb_items] = dir;
+        nb_items++;
     }
+    if( 0 == nb_items )
+        return PARSEC_HOOK_RETURN_DONE;
+    ret = dst_dev->memcpy_multi_async( dst_dev, gpu_stream, dsts, srcs, sizes, directions, nb_items );
+    if(PARSEC_SUCCESS != ret)
+        return PARSEC_HOOK_RETURN_ERROR;
     return PARSEC_HOOK_RETURN_DONE;
 }
 
 /* Default stage_out function to transfer data from the GPU device.
- * Transfer transfer the <count> contiguous bytes from
- * task->data[i].data_in to task->data[i].data_out.
+ * Transfer the <count> contiguous bytes for every flow set in flow_mask from
+ * task->data[i].data_in to task->data[i].data_out, as a single multi-item transfer.
  *
  * @param[in] task parsec_task_t containing task->data[i].data_in, task->data[i].data_out.
  * @param[in] flow_mask indicating task flows for which to transfer.
@@ -1318,14 +1347,19 @@ parsec_default_gpu_stage_out(parsec_gpu_task_t        *gtask,
                              uint32_t                  flow_mask,
                              parsec_gpu_exec_stream_t *gpu_stream)
 {
-    int ret;
+    int ret, nb_items = 0;
     parsec_data_copy_t * source;
     parsec_data_copy_t * dest;
-    parsec_device_gpu_module_t *dst_dev, *src_dev;
+    parsec_device_gpu_module_t *dst_dev, *src_dev = NULL;
     parsec_task_t *task = gtask->ec;
     size_t count;
     parsec_device_transfer_direction_t dir;
     int i;
+    void *dsts[MAX_PARAM_COUNT];
+    void *srcs[MAX_PARAM_COUNT];
+    size_t sizes[MAX_PARAM_COUNT];
+    parsec_device_transfer_direction_t directions[MAX_PARAM_COUNT];
+
     for(i = 0; i < task->task_class->nb_flows; i++){
         if(flow_mask & (1U << i)){
             source = task->data[i].data_out;
@@ -1351,33 +1385,40 @@ parsec_default_gpu_stage_out(parsec_gpu_task_t        *gtask,
                     return PARSEC_HOOK_RETURN_ERROR;
                 }
             }
-            ret = src_dev->memcpy_async( src_dev, gpu_stream,
-                                         dest->device_private,
-                                         source->device_private,
-                                         count,
-                                         dir );
-            if(PARSEC_SUCCESS != ret) {
-                return PARSEC_HOOK_RETURN_ERROR;
-            }
+            assert(nb_items < MAX_PARAM_COUNT);
+            dsts[nb_items]       = dest->device_private;
+            srcs[nb_items]       = source->device_private;
+            sizes[nb_items]      = count;
+            directions[nb_items] = dir;
+            nb_items++;
         }
+    }
+    if( 0 == nb_items )
+        return PARSEC_HOOK_RETURN_DONE;
+    ret = src_dev->memcpy_multi_async( src_dev, gpu_stream, dsts, srcs, sizes, directions, nb_items );
+    if(PARSEC_SUCCESS != ret) {
+        return PARSEC_HOOK_RETURN_ERROR;
     }
     return PARSEC_HOOK_RETURN_DONE;
 }
 
 /**
  * If the most current version of the data is not yet available on the GPU memory
- * schedule a transfer.
+ * decide whether a transfer is needed, and if so mark this flow's bit in
+ * *transfer_mask. The caller is responsible for issuing the actual gpu_task->stage_in
+ * call (once, covering every flow whose bit got set) after all flows have been decided.
  * Returns hook special return codes or a positive number:
  *    HOOK_DONE: The most recent version of the data is already available on the GPU
- *    1: A copy has been scheduled on the corresponding stream
- *   HOOK_ERROR: A copy cannot be issued due to GPU.
+ *    1: A transfer is needed (bit set in *transfer_mask) or already scheduled
+ *   HOOK_AGAIN: Retry this flow later, no ownership/coherency state has changed
  */
 static inline int
 parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
                              const parsec_flow_t *flow,
                              parsec_data_pair_t* task_data,
                              parsec_gpu_task_t *gpu_task,
-                             parsec_gpu_exec_stream_t *gpu_stream )
+                             parsec_gpu_exec_stream_t *gpu_stream,
+                             uint32_t *transfer_mask )
 {
     int32_t type = flow->flow_flags;
     parsec_data_copy_t *candidate = task_data->data_in;  /* best candidate for now */
@@ -1630,20 +1671,9 @@ parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
     }
 #endif
     gpu_task->sources[flow->flow_index] = candidate;  /* save the candidate for release on transfer completion */
-    /* Push data into the GPU from the source device */
-    int rc = gpu_task->stage_in ? gpu_task->stage_in(gpu_task, (1U << flow->flow_index), gpu_stream): PARSEC_SUCCESS;
-    if(PARSEC_SUCCESS != rc) {
-        parsec_warning( "GPU[%d:%s]: gpu_task->stage_in to device rc=%d @%s:%d\n"
-                        "\t<<%p on device %d:%s>> -> <<%p on device %d:%s>> [%zu, %s]",
-                        gpu_device->super.device_index, gpu_device->super.name, rc, __func__, __LINE__,
-                        candidate->device_private, candidate_dev->super.device_index, candidate_dev->super.name,
-                        gpu_elem->device_private, gpu_device->super.device_index, gpu_device->super.name,
-                        nb_elts,
-                        (candidate_dev->super.type & gpu_device->super.type & PARSEC_DEV_ANY_TYPE)? "D2D": "H2D");
-        parsec_atomic_unlock( &original->lock );
-        assert(0);
-        return PARSEC_HOOK_RETURN_ERROR;
-    }
+    /* Mark this flow as needing a transfer from the source device; the caller issues
+     * the actual gpu_task->stage_in call once, covering every flow marked this way. */
+    *transfer_mask |= (1U << flow->flow_index);
     assert(candidate_dev->super.device_index < gpu_device->super.data_in_array_size);
     gpu_device->super.data_in_from_device[candidate_dev->super.device_index] += nb_elts;
     if( PARSEC_GPU_TASK_TYPE_KERNEL == gpu_task->task_type )
@@ -2285,6 +2315,7 @@ parsec_device_kernel_push( parsec_device_gpu_module_t      *gpu_device,
     parsec_task_t *this_task = gpu_task->ec;
     const parsec_flow_t *flow;
     int i, ret = 0, how_many = 0;
+    uint32_t transfer_mask = 0;
 #if defined(PARSEC_DEBUG_NOISIER)
     char tmp[MAX_TASK_STRLEN];
 #endif
@@ -2350,12 +2381,30 @@ parsec_device_kernel_push( parsec_device_gpu_module_t      *gpu_device,
                              gpu_device->super.device_index, gpu_device->super.name, flow->name,
                              this_task->data[i].data_out->original->key);
         ret = parsec_device_data_stage_in( gpu_device, flow,
-                                           &(this_task->data[i]), gpu_task, gpu_stream );
+                                           &(this_task->data[i]), gpu_task, gpu_stream, &transfer_mask );
         if( ret < 0 ) {
+            /* Flush any transfers already decided for earlier flows before propagating
+             * this error/retry: those flows are already marked UNDER_TRANSFER and must
+             * have a matching physical copy actually issued for them. */
+            if( transfer_mask != 0 ) {
+                int rc = gpu_task->stage_in ? gpu_task->stage_in(gpu_task, transfer_mask, gpu_stream) : PARSEC_SUCCESS;
+                if( PARSEC_SUCCESS != rc ) {
+                    gpu_task->last_status = PARSEC_HOOK_RETURN_ERROR;
+                    return PARSEC_HOOK_RETURN_ERROR;
+                }
+            }
             gpu_task->last_status = ret;
             return ret;
         }
         how_many += ret;
+    }
+
+    if( transfer_mask != 0 ) {
+        int rc = gpu_task->stage_in ? gpu_task->stage_in(gpu_task, transfer_mask, gpu_stream) : PARSEC_SUCCESS;
+        if( PARSEC_SUCCESS != rc ) {
+            gpu_task->last_status = PARSEC_HOOK_RETURN_ERROR;
+            return PARSEC_HOOK_RETURN_ERROR;
+        }
     }
 
     PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
@@ -2465,22 +2514,26 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
 #endif
 
     if (gpu_task->task_type == PARSEC_GPU_TASK_TYPE_D2HTRANSFER) {
+        uint32_t transfer_mask = 0;
+        int nb_transfers = 0;
         for( i = 0; i < this_task->locals[0].value; i++ ) {
             gpu_copy = this_task->data[i].data_out;
             /* If the gpu copy is not owned by parsec, we don't manage it at all */
             if( 0 == (gpu_copy->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) ) continue;
-            original = gpu_copy->original;
-            rc = gpu_task->stage_out? gpu_task->stage_out(gpu_task, (1U << i), gpu_stream): PARSEC_SUCCESS;
+            transfer_mask |= (1U << i);
+            nb_transfers++;
+        }
+        if( transfer_mask != 0 ) {
+            rc = gpu_task->stage_out? gpu_task->stage_out(gpu_task, transfer_mask, gpu_stream): PARSEC_SUCCESS;
             if(PARSEC_SUCCESS != rc) {
                 parsec_warning( "GPU[%d:%s]: gpu_task->stage_out from device rc=%d @%s:%d\n"
-                                "\tdata %s <<%p>> -> <<%p>>\n",
+                                "\ttask %s transfer_mask=0x%x\n",
                                 gpu_device->super.device_index, gpu_device->super.name, rc, __func__, __LINE__,
-                                this_task->task_class->out[i]->name,
-                                gpu_copy->device_private, original->device_copies[0]->device_private);
+                                this_task->task_class->name, transfer_mask);
                 return_code = PARSEC_HOOK_RETURN_DISABLE;
                 goto release_and_return_error;
             }
-            how_many++;
+            how_many = nb_transfers;
         }
         return how_many;
     }
@@ -2489,6 +2542,10 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
                         "GPU[%d:%s]: Try to Pop %s",
                         gpu_device->super.device_index, gpu_device->super.name,
                         parsec_task_snprintf(tmp, MAX_TASK_STRLEN, this_task) );
+
+    uint32_t transfer_mask = 0;
+    size_t pending_bytes = 0;
+    int nb_pushout = 0;
 
     for( i = 0; i < this_task->task_class->nb_flows; i++ ) {
         /* We need to manage all data that has been used as input, even if they were read only */
@@ -2607,25 +2664,30 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
                     }
                 }
 #endif
-                /* Move the data back into main memory */
-                rc = gpu_task->stage_out? gpu_task->stage_out(gpu_task, (1U << flow->flow_index), gpu_stream): PARSEC_SUCCESS;
-                if(PARSEC_SUCCESS != rc) {
-                    parsec_warning( "GPU[%d:%s]: gpu_task->stage_out from device rc=%d @%s:%d\n"
-                                    "\tdata %s <<%p>> -> <<%p>>\n",
-                                    gpu_device->super.device_index, gpu_device->super.name, rc, __func__, __LINE__,
-                                    this_task->task_class->out[i]->name,
-                                    gpu_copy->device_private, original->device_copies[0]->device_private);
-                    return_code = PARSEC_HOOK_RETURN_DISABLE;
-                    parsec_atomic_unlock(&original->lock);
-                    goto release_and_return_error;
-                }
-                gpu_device->super.data_out_to_host += nb_elts; /* TODO: not hardcoded, use datatype size */
-                how_many++;
+                /* Defer the actual transfer: accumulate this flow into transfer_mask and
+                 * issue one combined gpu_task->stage_out call after the full loop. */
+                transfer_mask |= (1U << flow->flow_index);
+                pending_bytes += nb_elts; /* TODO: not hardcoded, use datatype size */
+                nb_pushout++;
             } else {
                 assert( 0 == gpu_copy->readers );
             }
         }
         parsec_atomic_unlock(&original->lock);
+    }
+
+    if( transfer_mask != 0 ) {
+        rc = gpu_task->stage_out? gpu_task->stage_out(gpu_task, transfer_mask, gpu_stream): PARSEC_SUCCESS;
+        if(PARSEC_SUCCESS != rc) {
+            parsec_warning( "GPU[%d:%s]: gpu_task->stage_out from device rc=%d @%s:%d\n"
+                            "\ttask %s transfer_mask=0x%x\n",
+                            gpu_device->super.device_index, gpu_device->super.name, rc, __func__, __LINE__,
+                            this_task->task_class->name, transfer_mask);
+            return_code = PARSEC_HOOK_RETURN_DISABLE;
+            goto release_and_return_error;
+        }
+        gpu_device->super.data_out_to_host += pending_bytes;
+        how_many += nb_pushout;
     }
 
   release_and_return_error:
