@@ -2384,6 +2384,92 @@ parsec_device_send_transfercomplete_cmd_to_device(parsec_data_copy_t *copy,
     parsec_fifo_push( &(((parsec_device_gpu_module_t*)dst_dev)->pending), (parsec_list_item_t*)gpu_task );
 }
 
+/**
+ * @brief Release a GPU reader held on @p source, a D2D transfer source owned by
+ *    @p src_device, on behalf of @p gpu_device. Serializes with whichever thread is
+ *    currently managing @p src_device (the mutex dance below): if nobody is, the
+ *    release is done directly under @p source->original->lock and the epoch is
+ *    bumped on last-reader release; otherwise a D2D_COMPLETE task is queued to
+ *    @p src_device so its own manager performs the release under the same lock.
+ *    Both the normal D2D-completion path and any failure/cleanup path that needs
+ *    to release a D2D reader must go through this helper: doing so without the
+ *    lock/manager coordination can relink the copy into a source-device LRU
+ *    concurrently with that device's own manager thread.
+ */
+static void
+parsec_device_release_d2d_reader(parsec_device_gpu_module_t *gpu_device,
+                                 parsec_data_copy_t *source,
+                                 parsec_device_gpu_module_t *src_device)
+{
+    if( !PARSEC_DEV_IS_GPU(src_device->super.type) )
+        return;
+
+    int om;
+    while(1) {
+        /* There are two ways out:
+         *   either we exit with om = 0, and then nobody was managing src_device,
+         *   and nobody can start managing src_device until we make it change from -1 to 0
+         *   (but anybody who has work to do will wait until that happens), or
+         *   we exit with om > 0, then there is a manager for that thread, and we have
+         *   increased mutex to warn the manager that there is another task for it to do.
+         */
+        om = src_device->mutex;
+        if(om == 0) {
+            /* Nobody at the door, let's try to lock the door */
+            if( parsec_atomic_cas_int32(&src_device->mutex, 0, -1) )
+                break;
+            continue;
+        }
+        if(om < 0 ) {
+            /* Damn, another thread is also trying to do an atomic operation on src_device,
+             * we give it some time and try again */
+            struct timespec delay;
+            delay.tv_nsec = 100;
+            delay.tv_sec = 0;
+            nanosleep(&delay, NULL);
+            continue;
+        }
+        /* There is a manager, let's try to reserve another task to do.
+         * If that fails, the manager may have leaved, try a gain. */
+        if( parsec_atomic_cas_int32(&src_device->mutex, om, om+1) )
+            break;
+    }
+    if( 0 == om ) {
+        int rc;
+        /* Nobody is at the door to handle that event on the source of that data...
+         * we do the command directly */
+        parsec_atomic_lock( &source->original->lock );
+        int readers = parsec_gpu_data_copy_release_reader(src_device, source, 1);
+        PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
+                             "GPU[%d:%s]:\tExecuting D2D transfer complete for copy %p [ref_count %d] for "
+                             "device %s -- readers now %d",
+                             gpu_device->super.device_index, gpu_device->super.name, source,
+                             source->super.super.obj_reference_count, src_device->super.name,
+                             readers);
+        assert(readers >= 0);
+        if(0 == readers) {
+            PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
+                                 "GPU[%d:%s]:\tMake read-only copy %p [ref_count %d] available",
+                                 gpu_device->super.device_index, gpu_device->super.name, source,
+                                 source->super.super.obj_reference_count);
+            src_device->data_avail_epoch++;
+        }
+        parsec_atomic_unlock( &source->original->lock );
+        /* Notify any waiting thread that we're done messing with that device structure */
+        rc = parsec_atomic_cas_int32(&src_device->mutex, -1, 0); (void)rc;
+        assert(rc);
+    } else {
+        PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
+                             "GPU[%d:%s]:\tSending D2D transfer complete command to %s for copy %p "
+                             "[ref_count %d] -- readers is still %d",
+                             gpu_device->super.device_index, gpu_device->super.name, src_device->super.name, source,
+                             source->super.super.obj_reference_count, source->readers);
+        parsec_device_send_transfercomplete_cmd_to_device(source,
+                                                          (parsec_device_module_t*)gpu_device,
+                                                          (parsec_device_module_t*)src_device);
+    }
+}
+
 static int
 parsec_device_callback_complete_push(parsec_device_gpu_module_t   *gpu_device,
                                      parsec_gpu_task_t           **gpu_task,
@@ -2487,72 +2573,7 @@ parsec_device_callback_complete_push(parsec_device_gpu_module_t   *gpu_device,
                                        NULL);
             }
 #endif
-            if( PARSEC_DEV_IS_GPU(src_device->super.type) ) {
-                int om;
-                while(1) {
-                    /* There are two ways out:
-                     *   either we exit with om = 0, and then nobody was managing src_device,
-                     *   and nobody can start managing src_device until we make it change from -1 to 0
-                     *   (but anybody who has work to do will wait until that happens), or
-                     *   we exit with om > 0, then there is a manager for that thread, and we have
-                     *   increased mutex to warn the manager that there is another task for it to do.
-                     */
-                    om = src_device->mutex;
-                    if(om == 0) {
-                        /* Nobody at the door, let's try to lock the door */
-                        if( parsec_atomic_cas_int32(&src_device->mutex, 0, -1) )
-                            break;
-                        continue;
-                    }
-                    if(om < 0 ) {
-                        /* Damn, another thread is also trying to do an atomic operation on src_device,
-                         * we give it some time and try again */
-                        struct timespec delay;
-                        delay.tv_nsec = 100;
-                        delay.tv_sec = 0;
-                        nanosleep(&delay, NULL);
-                        continue;
-                    }
-                    /* There is a manager, let's try to reserve another task to do.
-                     * If that fails, the manager may have leaved, try a gain. */
-                    if( parsec_atomic_cas_int32(&src_device->mutex, om, om+1) )
-                        break;
-                }
-                if( 0 == om ) {
-                    int rc;
-                    /* Nobody is at the door to handle that event on the source of that data...
-                     * we do the command directly */
-                    parsec_atomic_lock( &source->original->lock );
-                    int readers = parsec_gpu_data_copy_release_reader(src_device, source, 1);
-                    PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
-                                         "GPU[%d:%s]:\tExecuting D2D transfer complete for copy %p [ref_count %d] for "
-                                         "device %s -- readers now %d",
-                                         gpu_device->super.device_index, gpu_device->super.name, source,
-                                         source->super.super.obj_reference_count, src_device->super.name,
-                                         readers);
-                    assert(readers >= 0);
-                    if(0 == readers) {
-                        PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
-                                             "GPU[%d:%s]:\tMake read-only copy %p [ref_count %d] available",
-                                             gpu_device->super.device_index, gpu_device->super.name, source,
-                                             source->super.super.obj_reference_count);
-                        src_device->data_avail_epoch++;
-                    }
-                    parsec_atomic_unlock( &source->original->lock );
-                    /* Notify any waiting thread that we're done messing with that device structure */
-                    rc = parsec_atomic_cas_int32(&src_device->mutex, -1, 0); (void)rc;
-                    assert(rc);
-                } else {
-                    PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
-                                         "GPU[%d:%s]:\tSending D2D transfer complete command to %s for copy %p "
-                                         "[ref_count %d] -- readers is still %d",
-                                         gpu_device->super.device_index, gpu_device->super.name, src_device->super.name, source,
-                                         source->super.super.obj_reference_count, source->readers);
-                    parsec_device_send_transfercomplete_cmd_to_device(source,
-                                                                      (parsec_device_module_t*)gpu_device,
-                                                                      (parsec_device_module_t*)src_device);
-                }
-            }
+            parsec_device_release_d2d_reader(gpu_device, source, src_device);
             continue;
         }
         PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
@@ -2767,9 +2788,15 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
  *    A reader was acquired for flow i iff its resolved source is GPU-resident and
  *    the flow has READ access -- this is externally derivable from
  *    gpu_task->flow_info[i].source/.flow without needing extra per-flow state.
+ *
+ *    Releases go through parsec_device_release_d2d_reader(), the same lock/manager
+ *    protocol the normal D2D-completion path uses: releasing without it can relink
+ *    the copy into the source device's LRU concurrently with that device's own
+ *    manager thread.
  */
 static inline void
-parsec_device_kernel_push_release_readers_on_failure(parsec_gpu_task_t *gpu_task, uint32_t transfer_mask)
+parsec_device_kernel_push_release_readers_on_failure(parsec_device_gpu_module_t *gpu_device,
+                                                      parsec_gpu_task_t *gpu_task, uint32_t transfer_mask)
 {
     for(uint32_t i = 0; i < gpu_task->nb_flows; i++) {
         if( !(transfer_mask & (1U << i)) ) continue;
@@ -2779,8 +2806,7 @@ parsec_device_kernel_push_release_readers_on_failure(parsec_gpu_task_t *gpu_task
         if( !(flow->flow_flags & PARSEC_FLOW_ACCESS_READ) ) continue;
         parsec_device_module_t *src_dev_mod = parsec_mca_device_get(src->device_index);
         if( (NULL == src_dev_mod) || !PARSEC_DEV_IS_GPU(src_dev_mod->type) ) continue;
-        int readers = parsec_gpu_data_copy_release_reader((parsec_device_gpu_module_t*)src_dev_mod, src, 1);
-        assert(readers >= 0);
+        parsec_device_release_d2d_reader(gpu_device, src, (parsec_device_gpu_module_t*)src_dev_mod);
     }
 }
 
@@ -2906,7 +2932,7 @@ parsec_device_kernel_push( parsec_device_gpu_module_t      *gpu_device,
                     parsec_warning( "GPU[%d:%s]: gpu_task->stage_in to device rc=%d @%s:%d for task %s transfer_mask=0x%x",
                                     gpu_device->super.device_index, gpu_device->super.name, rc, __func__, __LINE__,
                                     this_task->task_class->name, transfer_mask);
-                    parsec_device_kernel_push_release_readers_on_failure(gpu_task, transfer_mask);
+                    parsec_device_kernel_push_release_readers_on_failure(gpu_device, gpu_task, transfer_mask);
                     assert(0);
                     gpu_task->last_status = PARSEC_HOOK_RETURN_ERROR;
                     return PARSEC_HOOK_RETURN_ERROR;
@@ -2928,7 +2954,7 @@ parsec_device_kernel_push( parsec_device_gpu_module_t      *gpu_device,
             parsec_warning( "GPU[%d:%s]: gpu_task->stage_in to device rc=%d @%s:%d for task %s transfer_mask=0x%x",
                             gpu_device->super.device_index, gpu_device->super.name, rc, __func__, __LINE__,
                             this_task->task_class->name, transfer_mask);
-            parsec_device_kernel_push_release_readers_on_failure(gpu_task, transfer_mask);
+            parsec_device_kernel_push_release_readers_on_failure(gpu_device, gpu_task, transfer_mask);
             assert(0);
             gpu_task->last_status = PARSEC_HOOK_RETURN_ERROR;
             return PARSEC_HOOK_RETURN_ERROR;
