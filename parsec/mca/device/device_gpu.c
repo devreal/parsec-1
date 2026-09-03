@@ -2265,6 +2265,11 @@ parsec_device_send_transfercomplete_cmd_to_device(parsec_data_copy_t *copy,
     PARSEC_OBJ_CONSTRUCT(gpu_task->ec, parsec_task_t);
     gpu_task->ec->task_class = &parsec_device_d2d_complete_tc;
     gpu_task->ec->priority = INT32_MAX; /* This task should be executed as soon as possible */
+    /* The pending heap compares gpu_task->priority, not gpu_task->ec->priority: priority
+     * inheritance from ec normally happens in parsec_device_kernel_scheduler(), which this
+     * direct-enqueue path bypasses. Set it explicitly so this command is not starved behind
+     * normal work. */
+    gpu_task->priority = INT32_MAX;
     gpu_task->nb_flows = 1;
     gpu_task->flow_info[0].flow = &parsec_device_d2d_complete_flow;
     gpu_task->flow_info[0].flow_span = copy->original->span;
