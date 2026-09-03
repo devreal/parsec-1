@@ -19,22 +19,33 @@
 #define HSET_LEFT(it, v)  ((it)->list_prev = (volatile struct parsec_list_item_s *)(v))
 #define HSET_RIGHT(it, v) ((it)->list_next = (volatile struct parsec_list_item_s *)(v))
 
-static inline int heap_cmp(const parsec_heap_t *h,
+static inline int heap_cmp(const parsec_binheap_t *h,
                             const parsec_list_item_t *a,
                             const parsec_list_item_t *b)
 {
     int va = COMPARISON_VAL(a, h->comp_offset);
     int vb = COMPARISON_VAL(b, h->comp_offset);
-    return (va > vb) - (va < vb);
+    if (va != vb) return (va > vb) - (va < vb);
+    if (PARSEC_HEAP_NO_SEQ == h->seq_offset) return 0;
+    /* Break the tie in FIFO order: the element that was enqueued earlier
+     * (smaller sequence number) compares as greater, so it surfaces to the
+     * root ahead of later arrivals of the same priority and cannot be
+     * starved by a continuous stream of equal-priority insertions. */
+    uint64_t sa = *(const uint64_t *)((const char *)a + h->seq_offset);
+    uint64_t sb = *(const uint64_t *)((const char *)b + h->seq_offset);
+    return (sa < sb) - (sa > sb);
 }
 
 /* Maximum depth of the path array.  64 supports heaps of up to 2^64 elements. */
 #define HEAP_MAX_DEPTH 64
 
-int parsec_heap_push(parsec_heap_t *heap, parsec_list_item_t *item)
+int parsec_heap_push(parsec_binheap_t *heap, parsec_list_item_t *item)
 {
     HSET_LEFT(item, NULL);
     HSET_RIGHT(item, NULL);
+    if (PARSEC_HEAP_NO_SEQ != heap->seq_offset) {
+        *(uint64_t *)((char *)item + heap->seq_offset) = heap->next_seq++;
+    }
     heap->size++;
 
     if (heap->size == 1) {
@@ -97,7 +108,7 @@ int parsec_heap_push(parsec_heap_t *heap, parsec_list_item_t *item)
     return PARSEC_SUCCESS;
 }
 
-parsec_list_item_t *parsec_heap_pop(parsec_heap_t *heap)
+parsec_list_item_t *parsec_heap_pop(parsec_binheap_t *heap)
 {
     if (0 == heap->size) return NULL;
 
@@ -191,7 +202,7 @@ parsec_list_item_t *parsec_heap_pop(parsec_heap_t *heap)
     return root;
 }
 
-int parsec_heap_push_chain(parsec_heap_t *heap, parsec_list_item_t *chain)
+int parsec_heap_push_chain(parsec_binheap_t *heap, parsec_list_item_t *chain)
 {
     parsec_list_item_t *item = chain;
     do {

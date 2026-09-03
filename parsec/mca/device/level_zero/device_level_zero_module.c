@@ -417,7 +417,8 @@ int parsec_level_zero_module_init( int dev_id, parsec_device_level_zero_driver_t
     PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_lru,       parsec_list_t);
     PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_owned_lru, parsec_list_t);
     PARSEC_OBJ_CONSTRUCT(&gpu_device->pending, parsec_lifo_t);
-    parsec_heap_init(&gpu_device->pending_heap, offsetof(parsec_gpu_task_t, priority));
+    parsec_heap_init(&gpu_device->pending_heap, offsetof(parsec_gpu_task_t, priority),
+                     offsetof(parsec_gpu_task_t, heap_seq));
 
     gpu_device->peer_access_mask = 0;  /* No GPU to GPU direct transfer by default */
 
