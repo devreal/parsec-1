@@ -384,6 +384,7 @@ if( PARSEC_WITH_DEVEL_HEADERS )
   install(FILES
           ${CMAKE_CURRENT_SOURCE_DIR}/class/dequeue.h
           ${CMAKE_CURRENT_SOURCE_DIR}/class/fifo.h
+          ${CMAKE_CURRENT_SOURCE_DIR}/class/parsec_heap.h
           DESTINATION ${PARSEC_INSTALL_INCLUDEDIR}/parsec/class )
 
 endif(PARSEC_WITH_DEVEL_HEADERS)

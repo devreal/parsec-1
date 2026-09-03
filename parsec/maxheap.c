@@ -37,7 +37,10 @@ parsec_task_heap_t* heap_create(void)
     h->list_item.list_next = (parsec_list_item_t*)h;
     h->list_item.list_prev = (parsec_list_item_t*)h;
     h->priority = 0;
-    parsec_heap_init(&h->heap, offsetof(parsec_task_t, priority));
+    /* parsec_task_t has no spare field to stamp a FIFO sequence into, so
+     * priority ties are broken arbitrarily here, as before this heap was
+     * backed by the shared parsec_heap engine. */
+    parsec_heap_init(&h->heap, offsetof(parsec_task_t, priority), PARSEC_HEAP_NO_SEQ);
     return h;
 }
 
@@ -106,7 +109,7 @@ heap_split_and_steal(parsec_task_heap_t **heap_ptr,
     *new_heap_ptr = NULL;
     if (NULL == heap) return NULL;
 
-    parsec_heap_t *h = &heap->heap;
+    parsec_binheap_t *h = &heap->heap;
     assert(h->top != NULL);
 
     parsec_task_t *to_use = (parsec_task_t*)h->top;

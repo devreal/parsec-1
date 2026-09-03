@@ -118,6 +118,7 @@ typedef struct parsec_gpu_flow_info_s {
 struct parsec_gpu_task_s {
     parsec_list_item_t                     list_item;
     int32_t                                priority; /**< device task priority, inherited from task if < 0 */
+    uint64_t                               heap_seq; /**< FIFO tie-break stamp, set by parsec_heap_push(); see pending_heap */
     uint16_t                               task_type;
     uint16_t                               pushout;
     int32_t                                last_status;
@@ -272,7 +273,7 @@ struct parsec_device_gpu_module_s {
     parsec_list_t              gpu_mem_lru;   /* Read-only blocks, and fresh blocks */
     parsec_list_t              gpu_mem_owned_lru;  /* Dirty blocks */
     parsec_lifo_t              pending;       /**< lock-free LIFO: CPU threads push here */
-    parsec_heap_t              pending_heap;  /**< manager-private max-heap for priority ordering */
+    parsec_binheap_t           pending_heap;  /**< manager-private max-heap for priority ordering */
     struct zone_malloc_s      *memory;
     parsec_gpu_exec_stream_t **exec_stream;
     size_t                     mem_block_size;

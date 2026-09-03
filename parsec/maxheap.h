@@ -15,7 +15,7 @@
 BEGIN_C_DECLS
 
 /**
- * Wrapper around parsec_heap_t that adds the list_item field (so the heap
+ * Wrapper around parsec_binheap_t that adds the list_item field (so the heap
  * can be stored in scheduler lists) and an explicit 'priority' field (the
  * max priority of any task in the heap, used by parsec_hbbuffer_pop_best
  * to pick the best heap to steal from without traversing the tree).
@@ -25,7 +25,7 @@ BEGIN_C_DECLS
 typedef struct parsec_task_heap_s {
     parsec_list_item_t  list_item;  /**< for compatibility with scheduler lists */
     unsigned int        priority;   /**< max priority of any task in this heap */
-    parsec_heap_t       heap;       /**< pointer-based max-heap storage */
+    parsec_binheap_t    heap;       /**< pointer-based max-heap storage */
 } parsec_task_heap_t;
 
 /** Allocate an empty heap as a singleton list item with zero priority. */
