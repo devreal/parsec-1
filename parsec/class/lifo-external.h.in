@@ -167,6 +167,39 @@ PARSEC_DECLSPEC parsec_list_item_t*
 parsec_lifo_nolock_pop(parsec_lifo_t* lifo);
 
 /**
+ * @brief Detach and return the entire chain of elements currently in the LIFO
+ *
+ * @details Atomically remove all elements from the LIFO at once and return
+ *          them as a chain (linked through list_next, in LIFO order), or
+ *          NULL if the LIFO was empty. The LIFO is left empty.
+ *
+ * @param[inout] lifo the LIFO to detach all elements from
+ * @return the chain of elements that was removed from the LIFO (NULL if
+ *         the LIFO was empty)
+ *
+ * @remark this function is thread safe
+ */
+PARSEC_DECLSPEC parsec_list_item_t*
+parsec_lifo_detach_chain(parsec_lifo_t* lifo);
+
+/**
+ * @brief Detach and return the entire chain of elements currently in the
+ *        LIFO, without forcing atomicity.
+ *
+ * @details Remove all elements from the LIFO at once and return them as a
+ *          chain (linked through list_next, in LIFO order), or NULL if the
+ *          LIFO was empty. The LIFO is left empty.
+ *
+ * @param[inout] lifo the LIFO to detach all elements from
+ * @return the chain of elements that was removed from the LIFO (NULL if
+ *         the LIFO was empty)
+ *
+ * @remark this function is not thread safe
+ */
+PARSEC_DECLSPEC parsec_list_item_t*
+parsec_lifo_nolock_detach_chain(parsec_lifo_t* lifo);
+
+/**
  * @brief Allocate a lifo item.
  *
  * @details Allocate an element that is correctly aligned to be 
