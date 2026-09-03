@@ -233,14 +233,18 @@ LIFO_STATIC_INLINE int parsec_lifo_nolock_is_empty( parsec_lifo_t* lifo ) {
     return (NULL == lifo->lifo_head.data.item);
 }
 
-/* Detach all elements in the chain */
+/* Detach all elements in the chain. Unlike PARSEC_ITEM_DETACH, this must not
+ * poison list_next/list_prev: callers traverse those links (e.g. to walk the
+ * detached chain into a heap) after this macro returns. Only the paranoid
+ * ownership/refcount bookkeeping is performed here. */
 #if defined(PARSEC_DEBUG_PARANOID)
 #define PARSEC_CHAIN_DETACH(item) {                                              \
     parsec_list_item_t *_item = (item);                                          \
     while (_item != NULL) {                                                      \
-        parsec_list_item_t *next = (parsec_list_item_t *) _item->list_next;      \
-        PARSEC_ITEM_DETACH(_item);                                               \
-        _item = next;                                                            \
+        assert( _item->belong_to != (void*)_item );                              \
+        _item->refcount = _item->refcount-1;                                     \
+        assert( 0 == _item->refcount );                                          \
+        _item = (parsec_list_item_t *) _item->list_next;                         \
     }                                                                            \
 }
 #else
@@ -383,13 +387,6 @@ parsec_lifo_detach_chain(parsec_lifo_t *lifo)
     } while (!parsec_update_counted_pointer(&lifo->lifo_head, old_head, NULL));
     parsec_atomic_wmb();
     parsec_list_item_t *item = old_head.data.item;
-#if defined(PARSEC_DEBUG_PARANOID)
-    while (item != NULL) {
-        parsec_list_item_t *next = (parsec_list_item_t *) item->list_next;
-        PARSEC_ITEM_DETACH(item);
-        item = next;
-    }
-#endif
     PARSEC_CHAIN_DETACH(item);
     return item;
 }
