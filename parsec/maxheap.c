@@ -15,19 +15,25 @@
 
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* list_prev = left child, list_next = right child (same as parsec_heap.c) */
 #define HLEFT(item)  ((parsec_list_item_t *)(item)->list_prev)
 #define HRIGHT(item) ((parsec_list_item_t *)(item)->list_next)
 
-/* Highest set bit: used to compute sub-heap sizes in heap_split_and_steal. */
-static inline unsigned int hiBit(unsigned int n)
+/* Highest set bit: used to compute sub-heap sizes in heap_split_and_steal().
+ * Operates on size_t (not unsigned int) so it stays correct for heaps whose
+ * size exceeds UINT_MAX. */
+static inline size_t hiBit(size_t n)
 {
     n |= (n >>  1);
     n |= (n >>  2);
     n |= (n >>  4);
     n |= (n >>  8);
     n |= (n >> 16);
+#if SIZE_MAX > 0xFFFFFFFFu
+    n |= (n >> 32);
+#endif
     return n - (n >> 1);
 }
 
@@ -138,9 +144,9 @@ heap_split_and_steal(parsec_task_heap_t **heap_ptr,
 
     /* >= 3 nodes: split into left (new_heap) and right (heap) subtrees */
     {
-        unsigned int size     = (unsigned int)h->size;
-        unsigned int highBit  = hiBit(size);
-        unsigned int twoBit   = highBit >> 1;
+        size_t size     = h->size;
+        size_t highBit  = hiBit(size);
+        size_t twoBit   = highBit >> 1;
 
         *new_heap_ptr = heap_create();
         (*new_heap_ptr)->heap.comp_offset = h->comp_offset;
@@ -155,11 +161,11 @@ heap_split_and_steal(parsec_task_heap_t **heap_ptr,
         heap->priority = (unsigned int)COMPARISON_VAL(right_top, h->comp_offset);
 
         if (twoBit & size) { /* last node is in the right subtree */
-            h->size = (size_t)(~highBit & size);
-            (*new_heap_ptr)->heap.size = (size_t)(size - (unsigned int)h->size - 1);
+            h->size = ~highBit & size;
+            (*new_heap_ptr)->heap.size = size - h->size - 1;
         } else {             /* last node is in the left subtree */
-            (*new_heap_ptr)->heap.size = (size_t)((size & ~highBit) + twoBit);
-            h->size = (size_t)(size - (unsigned int)(*new_heap_ptr)->heap.size - 1);
+            (*new_heap_ptr)->heap.size = (size & ~highBit) + twoBit;
+            h->size = size - (*new_heap_ptr)->heap.size - 1;
         }
 
         /* Form a two-element ring so the caller can re-singleton each side */
