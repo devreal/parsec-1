@@ -2835,6 +2835,26 @@ parsec_device_kernel_cleanout( parsec_device_gpu_module_t *gpu_device,
     return 0;
 }
 
+/* parsec_lifo_detach_chain() returns tasks in LIFO order (most recently
+ * pushed first). parsec_heap_push_chain() stamps the FIFO tie-break
+ * sequence number in traversal order, so pushing a LIFO-ordered chain
+ * directly would give newer tasks smaller (i.e. "older") sequence numbers,
+ * inverting arrival-order fairness among equal-priority tasks within a
+ * single detached batch. Reverse the chain in place so it is walked
+ * oldest-first, matching true arrival order. */
+static parsec_list_item_t *
+parsec_gpu_pending_chain_reverse(parsec_list_item_t *chain)
+{
+    parsec_list_item_t *prev = NULL;
+    while (NULL != chain) {
+        parsec_list_item_t *next = (parsec_list_item_t *)chain->list_next;
+        chain->list_next = prev;
+        prev = chain;
+        chain = next;
+    }
+    return prev;
+}
+
 /**
  * This version is based on 4 streams: one for transfers from the memory to
  * the GPU, 2 for kernel executions and one for transfers from the GPU into
@@ -3022,6 +3042,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     {
         parsec_list_item_t *chain = parsec_lifo_detach_chain(&gpu_device->pending);
         if (NULL != chain) {
+            chain = parsec_gpu_pending_chain_reverse(chain);
             parsec_heap_push_chain(&gpu_device->pending_heap, chain);
         }
     }
