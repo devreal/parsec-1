@@ -3028,7 +3028,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     gpu_task = (parsec_gpu_task_t*)parsec_heap_pop(&gpu_device->pending_heap);
     if( NULL != gpu_task ) {
         pop_null = 0;
-        /* parsec_heap_push_ring() singletonizes each item; the popped task is already a singleton. */
+        /* parsec_heap_pop() singletonizes the returned item before returning it. */
         gpu_task->last_data_check_epoch = gpu_device->data_avail_epoch - 1;  /* force at least one tour */
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,  "GPU[%d:%s]:\tGet from shared queue %s", gpu_device->super.device_index, gpu_device->super.name,
                              parsec_device_describe_gpu_task(tmp, MAX_TASK_STRLEN, gpu_task));
