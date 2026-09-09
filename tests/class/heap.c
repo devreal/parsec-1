@@ -186,6 +186,24 @@ static void test_lifo_detach_to_heap_chain(void)
     printf("   ok (%d elements survived detach_chain -> push_chain)\n", popped_count);
 }
 
+/* parsec_heap_push_chain(heap, NULL) must be a no-op, not a crash: callers
+ * (e.g. the device management thread) pass through whatever
+ * parsec_lifo_detach_chain() returns, which is NULL for an empty LIFO. */
+static void test_push_chain_null(void)
+{
+    parsec_binheap_t heap;
+
+    printf(" - parsec_heap_push_chain(heap, NULL) must be a no-op\n");
+    parsec_heap_init(&heap, offsetof(elt_t, priority), offsetof(elt_t, seq));
+
+    if (PARSEC_SUCCESS != parsec_heap_push_chain(&heap, NULL))
+        fatal(" ! Error: parsec_heap_push_chain(heap, NULL) did not return PARSEC_SUCCESS\n");
+    if (!parsec_heap_is_empty(&heap))
+        fatal(" ! Error: parsec_heap_push_chain(heap, NULL) modified a heap\n");
+
+    parsec_heap_fini(&heap);
+    printf("   ok\n");
+}
 
 int main(int argc, char *argv[])
 {
@@ -198,6 +216,7 @@ int main(int argc, char *argv[])
     test_priority_order();
     test_fifo_fairness();
     test_lifo_detach_to_heap_chain();
+    test_push_chain_null();
 
 #if defined(PARSEC_HAVE_MPI)
     MPI_Finalize();

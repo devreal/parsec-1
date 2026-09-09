@@ -222,6 +222,7 @@ parsec_list_item_t *parsec_heap_pop(parsec_binheap_t *heap)
 
 int parsec_heap_push_chain(parsec_binheap_t *heap, parsec_list_item_t *chain)
 {
+    if (NULL == chain) return PARSEC_SUCCESS;
     parsec_list_item_t *item = chain;
     do {
         /* Capture list_next before parsec_heap_push repurposes it as right-child */

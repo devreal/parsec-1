@@ -100,7 +100,8 @@ int parsec_heap_push(parsec_binheap_t *heap, parsec_list_item_t *item);
 parsec_list_item_t *parsec_heap_pop(parsec_binheap_t *heap);
 
 /**
- * Batch-insert all elements from a chain or ring.
+ * Batch-insert all elements from a chain or ring. NULL is accepted and
+ * treated as a no-op (an empty chain to insert).
  * @return PARSEC_SUCCESS (cannot fail).
  */
 int parsec_heap_push_chain(parsec_binheap_t *heap, parsec_list_item_t *chain);
