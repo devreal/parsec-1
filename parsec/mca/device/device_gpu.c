@@ -471,6 +471,12 @@ parsec_device_data_advise(parsec_device_module_t *dev, parsec_data_t *data, int 
             gpu_task->ec = calloc(1, sizeof(parsec_task_t));
             PARSEC_OBJ_CONSTRUCT(gpu_task->ec, parsec_task_t);
             gpu_task->ec->task_class = &parsec_device_data_prefetch_tc;
+            /* The pending heap compares gpu_task->priority, not gpu_task->ec->priority:
+             * priority inheritance from ec normally happens in
+             * parsec_device_kernel_scheduler(), which this direct-enqueue path bypasses.
+             * Set it explicitly so this task is ranked the same as its ec priority
+             * instead of relying on the calloc()-zeroed default. */
+            gpu_task->priority = gpu_task->ec->priority;
             gpu_task->flow[0] = &parsec_device_data_prefetch_flow;
             gpu_task->flow_nb_elts[0] = data->device_copies[ data->owner_device ]->original->nb_elts;
             gpu_task->stage_in  = parsec_default_gpu_stage_in;
