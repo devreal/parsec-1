@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #if defined(PARSEC_HAVE_MPI)
