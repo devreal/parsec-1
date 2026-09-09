@@ -39,6 +39,28 @@ static inline int heap_cmp(const parsec_binheap_t *h,
 /* Maximum depth of the path array.  64 supports heaps of up to 2^64 elements. */
 #define HEAP_MAX_DEPTH 64
 
+/* Return the bit position just below the highest set bit of 'size' (size >= 2),
+ * i.e. the starting point for walking the bit path of 'size' down from the
+ * root of the complete binary tree (see parsec_heap_push()/parsec_heap_pop()).
+ *
+ * This must not be computed by repeatedly doubling a bitmask until it exceeds
+ * 'size': for size close to SIZE_MAX that doubling can overflow back to 0,
+ * which is always <= size, making the loop non-terminating. Bit-smearing
+ * finds the highest set bit without ever overflowing. */
+static inline size_t heap_nav_start_bitmask(size_t size)
+{
+    size_t v = size;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+#if SIZE_MAX > 0xFFFFFFFFu
+    v |= v >> 32;
+#endif
+    return (v - (v >> 1)) >> 1;
+}
+
 int parsec_heap_push(parsec_binheap_t *heap, parsec_list_item_t *item)
 {
     HSET_LEFT(item, NULL);
@@ -61,9 +83,7 @@ int parsec_heap_push(parsec_binheap_t *heap, parsec_list_item_t *item)
     int depth = 0;
 
     size_t size = heap->size;
-    size_t bitmask = 1;
-    while (bitmask <= size) bitmask <<= 1;
-    bitmask >>= 2;  /* position at bit just below the leading 1 */
+    size_t bitmask = heap_nav_start_bitmask(size);
 
     parsec_list_item_t *node = heap->top;
     path[depth++] = node;
@@ -126,9 +146,7 @@ parsec_list_item_t *parsec_heap_pop(parsec_binheap_t *heap)
      * can correctly wire it into root's position even after clearing the
      * pointer. */
     size_t size = heap->size;
-    size_t bitmask = 1;
-    while (bitmask <= size) bitmask <<= 1;
-    bitmask >>= 2;
+    size_t bitmask = heap_nav_start_bitmask(size);
 
     parsec_list_item_t *parent = heap->top;
     while (bitmask > 1) {
