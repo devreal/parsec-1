@@ -3086,6 +3086,22 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         if( PARSEC_GPU_TASK_TYPE_D2D_COMPLETE == gpu_task->task_type ) {
             goto get_data_out_of_device;
         }
+        int chain_len = 1;
+        bool can_batch = parsec_gpu_task_selected_chore_allows_batch(gpu_task->ec, (parsec_device_module_t*)gpu_device);
+        while (can_batch && chain_len < PARSEC_DEVICE_MAX_BATCH_SIZE) {
+            parsec_gpu_task_t *candidate = (parsec_gpu_task_t*)parsec_heap_peek(&gpu_device->pending_heap);
+            if (NULL == candidate) {
+                break;
+            }
+            if (gpu_task->ec->task_class != candidate->ec->task_class) {
+                break;
+            }
+            // remove the item from the heap
+            parsec_heap_pop(&gpu_device->pending_heap);
+            // TODO: push to the back of the ring to keep priorities in tact
+            parsec_list_item_ring_push((parsec_list_item_t*)candidate);
+            chain_len++;
+        }
     } else {
         pop_null++;
         if( pop_null % 1024 == 1023 ) {
