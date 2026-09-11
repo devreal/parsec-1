@@ -43,6 +43,12 @@ int parsec_gpu_verbosity;
 
 static thread_local int active_w2r_tasks = 0;
 
+/**
+ * Crutch: cap the max number of tasks that can be moved from one stage to the next.
+ * We should instead allow the user to express the max batch size in the task-class.
+ */
+#define PARSEC_DEVICE_MAX_BATCH_SIZE 64
+
 /* The return value of these functions is either a parsec_hook_return_t for <= 0 values,
  * or a positive number which represents that something has been scheduled on the gpu_stream
  */
@@ -2088,6 +2094,8 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
                                parsec_gpu_task_t** out_task )
 {
     int rc;
+    parsec_gpu_task_t* out_ring = NULL;
+    int ring_size = 0;
 #if defined(PARSEC_DEBUG_NOISIER)
     char task_str[MAX_TASK_STRLEN];
 #endif
@@ -2161,9 +2169,21 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
         task = (parsec_gpu_task_t*)parsec_list_nolock_pop_front(stream->fifo_pending);  /* get the next task */
     }
     if( NULL == task ) {  /* No tasks, we're done */
+        *out_task = out_ring;
         return PARSEC_HOOK_RETURN_DONE;
     }
     PARSEC_LIST_ITEM_SINGLETON((parsec_list_item_t *)task);
+
+    // if the new task has the same task class as the current ring (or no ring exists yet) we keep collecting tasks
+    bool same_class = (out_ring == NULL || (task->ec->task_class == out_ring->ec->task_class));
+    bool batchable = parsec_gpu_task_selected_chore_allows_batch(task->ec, (parsec_device_module_t*)gpu_device);
+
+    if (!(same_class && batchable) && out_ring != NULL) {
+        /* we have a ring of tasks to schedule, but the next task is not of the same class, so we return the ring and schedule it */
+        parsec_list_nolock_push_front(stream->fifo_pending, (parsec_list_item_t*)task);
+        *out_task = out_ring;
+        return PARSEC_HOOK_RETURN_DONE;
+    }
 
     assert( NULL == stream->tasks[stream->start] );
 
@@ -2180,8 +2200,18 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
         /* If progress_fct added nothing on that stream, we skip scheduling a record on the GPU stream */
         if( task->complete_stage )
             rc = task->complete_stage(gpu_device, &task, stream);
-        *out_task = task;
-        return rc;
+        if (out_ring == NULL) {
+            out_ring = task;
+        } else {
+            parsec_list_item_ring_push(&out_ring->list_item, &task->list_item);
+        }
+        ring_size++;
+        if (ring_size >= PARSEC_DEVICE_MAX_BATCH_SIZE) {
+            // found enough tasks to schedule
+            *out_task = out_ring;
+            return PARSEC_HOOK_RETURN_DONE;
+        }
+        goto grab_a_task;
     }
     if( 0 > rc ) {
         if( PARSEC_HOOK_RETURN_AGAIN != rc ) {
