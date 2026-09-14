@@ -1732,7 +1732,7 @@ static inline int parsec_gpu_task_same_chore(parsec_gpu_task_t *task1, parsec_gp
         (NULL == t2->task_class) ||
         (t1->selected_device != t2->selected_device) ||
         (t1->selected_chore != t2->selected_chore) ||
-        (t1->task_class->incarnations[t1->selected_chore]->hook != t2->task_class->incarnations[t2->selected_chore]->hook) ) {
+        (t1->task_class->incarnations[t1->selected_chore].hook != t2->task_class->incarnations[t2->selected_chore].hook) ) {
         return 0;
     }
 
@@ -3124,7 +3124,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
             // remove the item from the heap
             parsec_heap_pop(&gpu_device->pending_heap);
             // TODO: push to the back of the ring to keep priorities in tact
-            parsec_list_item_ring_push(&gpu_task->super, (parsec_list_item_t*)candidate);
+            parsec_list_item_ring_push((parsec_list_item_t*)gpu_task, (parsec_list_item_t*)candidate);
             chain_len++;
         }
     } else {
@@ -3172,7 +3172,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
             if (NULL == release_ring) {
                 release_ring = iter;
             } else {
-                parsec_list_item_ring_push(&release_ring->super, (parsec_list_item_t*)iter);
+                parsec_list_item_ring_push((parsec_list_item_t*)release_ring, (parsec_list_item_t*)iter);
             }
         }
         iter = next;
