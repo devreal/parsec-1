@@ -1718,6 +1718,27 @@ parsec_gpu_task_selected_chore_allows_batch(parsec_task_t *task,
            (0 != (chore->type & PARSEC_DEV_CHORE_ALLOW_BATCH));
 }
 
+/**
+ * Returns 1 if the two have the same chore hook.
+ */
+static inline int parsec_gpu_task_same_chore(parsec_gpu_task_t *task1, parsec_gpu_task_t *task2)
+{
+    parsec_task_t *t1 = task1->ec;
+    parsec_task_t *t2 = task2->ec;
+
+    if( (NULL == t1) ||
+        (NULL == t1->task_class) ||
+        (NULL == t2) ||
+        (NULL == t2->task_class) ||
+        (t1->selected_device != t2->selected_device) ||
+        (t1->selected_chore != t2->selected_chore) ||
+        (t1->task_class->incarnations[t1->selected_chore]->hook != t2->task_class->incarnations[t2->selected_chore]->hook) ) {
+        return 0;
+    }
+
+    return 1;
+}
+
 int
 parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
                               parsec_gpu_task_t *batch_head,
@@ -2175,10 +2196,10 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
     PARSEC_LIST_ITEM_SINGLETON((parsec_list_item_t *)task);
 
     // if the new task has the same task class as the current ring (or no ring exists yet) we keep collecting tasks
-    bool same_class = (out_ring == NULL || (task->ec->task_class == out_ring->ec->task_class));
+    bool same_chore = (out_ring == NULL || parsec_gpu_task_same_chore(task, out_ring));
     bool batchable = parsec_gpu_task_selected_chore_allows_batch(task->ec, (parsec_device_module_t*)gpu_device);
 
-    if (!(same_class && batchable) && out_ring != NULL) {
+    if (!(same_chore && batchable) && out_ring != NULL) {
         /* we have a ring of tasks to schedule, but the next task is not of the same class, so we return the ring and schedule it */
         parsec_list_nolock_push_front(stream->fifo_pending, (parsec_list_item_t*)task);
         *out_task = out_ring;
@@ -3097,13 +3118,13 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
             if (NULL == candidate) {
                 break;
             }
-            if (gpu_task->ec->task_class != candidate->ec->task_class) {
+            if (parsec_gpu_task_same_chore(gpu_task, candidate)) {
                 break;
             }
             // remove the item from the heap
             parsec_heap_pop(&gpu_device->pending_heap);
             // TODO: push to the back of the ring to keep priorities in tact
-            parsec_list_item_ring_push(gpu_task, (parsec_list_item_t*)candidate);
+            parsec_list_item_ring_push(&gpu_task->super, (parsec_list_item_t*)candidate);
             chain_len++;
         }
     } else {
@@ -3122,7 +3143,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     iter = gpu_task;
     do {
         /* Take the first item off the ring and process it */
-        parsec_gpu_task_t *next = (parsec_gpu_task_t*)parsec_list_item_ring_chop(iter);
+        parsec_gpu_task_t *next = (parsec_gpu_task_t*)parsec_list_item_ring_chop((parsec_list_item_t*)iter);
         PARSEC_LIST_ITEM_SINGLETON(iter);
 
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,  "GPU[%d:%s]:\tComplete %s",
@@ -3144,14 +3165,14 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                 if (NULL == task_ring) {
                     task_ring = iter->ec;
                 } else {
-                    parsec_list_item_ring_push(task_ring, (parsec_list_item_t*)iter->ec);
+                    parsec_list_item_ring_push(&task_ring->super, (parsec_list_item_t*)iter->ec);
                 }
             }
             /* still needs release_device_task via remove_gpu_task below */
             if (NULL == release_ring) {
                 release_ring = iter;
             } else {
-                parsec_list_item_ring_push((parsec_list_item_t*)release_ring, (parsec_list_item_t*)iter);
+                parsec_list_item_ring_push(&release_ring->super, (parsec_list_item_t*)iter);
             }
         }
         iter = next;
@@ -3171,7 +3192,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     iter = gpu_task;
     cnt = 0;
     do {
-        parsec_gpu_task_t *next = (parsec_gpu_task_t*)parsec_list_item_ring_chop(iter);
+        parsec_gpu_task_t *next = (parsec_gpu_task_t*)parsec_list_item_ring_chop((parsec_list_item_t*)iter);
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream, "GPU[%d:%s]: gpu_task %p freed",
                             gpu_device->super.device_index, gpu_device->super.name,
                             iter);
