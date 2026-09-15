@@ -2242,7 +2242,7 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
                  * the resubmission of this task as much as possible, but without loosing track of it
                  * (aka. returning it to the upper level).
                  */
-                parsec_list_nolock_push_back(stream->fifo_pending, (parsec_list_item_t*)task);
+                parsec_gpu_stream_push_pending(gpu_device, stream, task);
             } else {
                 /* Something else is going on with this task, remove it from the stream queues
                  * and return it to the upper level for final decision on its fate.
