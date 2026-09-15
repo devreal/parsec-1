@@ -2196,6 +2196,8 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
   schedule_task:
     rc = progress_fct( gpu_device, task, stream );
     if( 0 == rc && parsec_device_skip_empty_events ) {
+
+        assert(progress_fct != &parsec_device_kernel_exec);
 #if defined(PARSEC_PROF_TRACE)
         if( stream->prof_event_track_enable ) {
             if( task->prof_key_end != -1 ) {
@@ -2211,6 +2213,7 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
         } else {
             parsec_list_item_ring_push(&out_ring->list_item, &task->list_item);
         }
+        task = NULL;
         ring_size++;
         if (ring_size >= PARSEC_DEVICE_MAX_BATCH_SIZE) {
             // found enough tasks to schedule
@@ -3103,12 +3106,11 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
             if (NULL == candidate) {
                 break;
             }
-            if (parsec_gpu_task_same_chore(gpu_task, candidate)) {
+            if (!parsec_gpu_task_same_chore(gpu_task, candidate)) {
                 break;
             }
             // remove the item from the heap
             parsec_heap_pop(&gpu_device->pending_heap);
-            // TODO: push to the back of the ring to keep priorities in tact
             parsec_list_item_ring_push((parsec_list_item_t*)gpu_task, (parsec_list_item_t*)candidate);
             chain_len++;
         }
@@ -3181,6 +3183,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream, "GPU[%d:%s]: gpu_task %p freed",
                             gpu_device->super.device_index, gpu_device->super.name,
                             iter);
+        PARSEC_LIST_ITEM_SINGLETON(iter);
         if (NULL != iter->release_device_task) {
             iter->release_device_task(iter);
         }
