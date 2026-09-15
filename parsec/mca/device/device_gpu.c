@@ -49,6 +49,19 @@ static thread_local int active_w2r_tasks = 0;
  */
 #define PARSEC_DEVICE_MAX_BATCH_SIZE 64
 
+
+/**
+ * @brief Prepare a task for execution on the GPU. Basically, does some upstream initialization,
+ * setup the profiling information and then calls directly into the task submission body. Upon
+ * return from the body handle the state machine of the task, taking care of the special cases
+ * such as AGAIN and ASYNC.
+ * @returns An error if anything unexpected came out of the task submission body, otherwise
+ */
+static int
+parsec_device_kernel_exec( parsec_device_gpu_module_t      *gpu_device,
+                           parsec_gpu_task_t               *gpu_task,
+                           parsec_gpu_exec_stream_t        *gpu_stream);
+
 /* The return value of these functions is either a parsec_hook_return_t for <= 0 values,
  * or a positive number which represents that something has been scheduled on the gpu_stream
  */
