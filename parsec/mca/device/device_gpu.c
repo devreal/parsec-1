@@ -2155,21 +2155,6 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
                                      "GPU[%d:%s]: GPU task %p[%p] is ready to be rescheduled on the same GPU device and same stream",
                                      gpu_device->super.device_index, gpu_device->super.name, (void*)task, (void*)task->ec);
                 *out_task = NULL;
-#if 0
-                if (!parsec_gpu_task_is_singleton(task)) {
-                    /**
-                     * Batched tasks need to be returned to the pending queue. We can take the first
-                     * task in the ring and schedule it right away.
-                     * The follower tasks in the ring inherit the return status of the leader task.
-                     */
-                    parsec_gpu_task_t *cur = task;
-                    while ((cur = (parsec_gpu_task_t*)cur->list_item.list_next) != task) {
-                        cur->last_status = task->last_status;
-                    }
-                    parsec_list_chain_front(stream->fifo_pending, &task->list_item);
-                    task = (parsec_gpu_task_t*) parsec_list_pop_front(stream->fifo_pending);
-                }
-#endif
                 goto schedule_task;
             }
             assert( PARSEC_HOOK_RETURN_ASYNC != task->last_status );
