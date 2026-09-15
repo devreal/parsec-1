@@ -3191,9 +3191,9 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         iter = next;
     } while (iter != NULL);
 
-    rc = parsec_atomic_fetch_sub_int32( &(gpu_device->mutex), cnt );
+    rc = parsec_atomic_fetch_sub_int32( &(gpu_device->mutex), cnt ) - cnt;
 
-    if( 1 == rc ) {  /* I was the last one */
+    if( 0 == rc ) {  /* I was the last one */
 #if defined(PARSEC_PROF_TRACE)
         if( gpu_device->trackable_events & PARSEC_PROFILE_GPU_TRACK_OWN )
             PARSEC_PROFILING_TRACE( es->es_profile, parsec_gpu_own_GPU_key_end,
