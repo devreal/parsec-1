@@ -281,6 +281,7 @@ struct parsec_device_gpu_module_s {
     parsec_list_t              gpu_mem_owned_lru;  /* Dirty blocks */
     parsec_lifo_t              pending;       /**< lock-free LIFO: CPU threads push here */
     parsec_binheap_t           pending_heap;  /**< manager-private max-heap for priority ordering */
+    parsec_lifo_t              gpu_mem_inbox; /**< lock-free LIFO: other manager threads push here */
     struct zone_malloc_s      *memory;
     parsec_gpu_exec_stream_t **exec_stream;
     size_t                     mem_block_size;

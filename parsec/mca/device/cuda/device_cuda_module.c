@@ -620,6 +620,7 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
     PARSEC_OBJ_CONSTRUCT(&gpu_device->pending, parsec_lifo_t);
     parsec_heap_init(&gpu_device->pending_heap, offsetof(parsec_gpu_task_t, priority),
                      offsetof(parsec_gpu_task_t, heap_seq));
+    PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_inbox, parsec_lifo_t);
 
     gpu_device->peer_access_mask = 0;  /* No GPU to GPU direct transfer by default */
 
@@ -767,6 +768,7 @@ parsec_cuda_module_fini(parsec_device_module_t* device)
     /* Cleanup the GPU memory. */
     PARSEC_OBJ_DESTRUCT(&gpu_device->gpu_mem_lru);
     PARSEC_OBJ_DESTRUCT(&gpu_device->gpu_mem_owned_lru);
+    PARSEC_OBJ_DESTRUCT(&gpu_device->gpu_mem_inbox);
 
     return PARSEC_SUCCESS;
 }

@@ -308,7 +308,7 @@ void parsec_device_dump_gpu_state(parsec_device_gpu_module_t* gpu_device)
     for( i = 0; i < gpu_device->num_exec_streams; i++ ) {
         parsec_device_dump_exec_stream(gpu_device->exec_stream[i]);
     }
-    if( !parsec_list_is_empty(&gpu_device->gpu_mem_lru) ) {
+    if( !parsec_list_nolock_is_empty(&gpu_device->gpu_mem_lru) ) {
         parsec_output(parsec_gpu_output_stream, "#\n# LRU list\n#\n");
         i = 0;
         PARSEC_LIST_ITERATOR(&gpu_device->gpu_mem_lru, item,
@@ -320,7 +320,7 @@ void parsec_device_dump_gpu_state(parsec_device_gpu_module_t* gpu_device)
                                  i++;
                              });
     }
-    if( !parsec_list_is_empty(&gpu_device->gpu_mem_owned_lru) ) {
+    if( !parsec_list_nolock_is_empty(&gpu_device->gpu_mem_owned_lru) ) {
         parsec_output(parsec_gpu_output_stream, "#\n# Owned LRU list\n#\n");
         i = 0;
         PARSEC_LIST_ITERATOR(&gpu_device->gpu_mem_owned_lru, item,
@@ -697,10 +697,10 @@ parsec_device_memory_reserve( parsec_device_gpu_module_t* gpu_device,
         PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                             "GPU[%d:%s] Retain and insert GPU copy %p [ref_count %d] in LRU",
                             gpu_device->super.device_index, gpu_device->super.name, gpu_elem, gpu_elem->super.obj_reference_count);
-        parsec_list_push_back( &gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_elem );
+        parsec_list_nolock_push_back( &gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_elem );
         gpu_device->memory_info( gpu_device, &free_mem, &total_mem );
     }
-    if( 0 == mem_elem_per_gpu && parsec_list_is_empty( &gpu_device->gpu_mem_lru ) ) {
+    if( 0 == mem_elem_per_gpu && parsec_list_nolock_is_empty( &gpu_device->gpu_mem_lru ) ) {
         parsec_warning("GPU[%d:%s] Cannot allocate memory on GPU %s. Skip it!", gpu_device->super.device_index, gpu_device->super.name, gpu_device->super.name);
     }
     else {
@@ -785,7 +785,7 @@ static void parsec_device_memory_release_list(parsec_device_gpu_module_t* gpu_de
     parsec_list_item_t* item;
     int num_discarded = 0;
 
-    while(NULL != (item = parsec_list_pop_front(list)) ) {
+    while(NULL != (item = parsec_list_nolock_pop_front(list)) ) {
         parsec_gpu_data_copy_t* gpu_copy = (parsec_gpu_data_copy_t*)item;
         parsec_data_t* original = gpu_copy->original;
 
@@ -969,7 +969,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                                             "GPU[%d:%s]:%s:\tAdd copy %p [ref_count %d] back to the LRU list",
                                             gpu_device->super.device_index, gpu_device->super.name, task_name,
                                             temp_loc[j], temp_loc[j]->super.super.obj_reference_count);
-                        parsec_list_push_front(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)temp_loc[j]);
+                        parsec_list_nolock_push_front(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)temp_loc[j]);
                     }
                     parsec_atomic_unlock(&master->lock);
                     return PARSEC_HOOK_RETURN_AGAIN;
@@ -997,7 +997,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
         find_another_data:
             temp_loc[i] = NULL;
             /* Look for a data_copy to free */
-            lru_gpu_elem = (parsec_gpu_data_copy_t*)parsec_list_pop_front(&gpu_device->gpu_mem_lru);
+            lru_gpu_elem = (parsec_gpu_data_copy_t*)parsec_list_nolock_pop_front(&gpu_device->gpu_mem_lru);
             if( NULL == lru_gpu_elem ) {
                 /* We can't find enough room on the GPU. Insert the tiles in the begining of
                  * the LRU (in order to be reused asap) and return with error.
@@ -1019,7 +1019,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                                          gpu_device->super.device_index, gpu_device->super.name, task_name,
                                          temp_loc[j], temp_loc[j]->super.super.obj_reference_count);
                     /* push them at the head to reach them again at the next iteration */
-                    parsec_list_push_front(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)temp_loc[j]);
+                    parsec_list_nolock_push_front(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)temp_loc[j]);
                 }
 #if !defined(PARSEC_GPU_ALLOC_PER_TILE)
                 PARSEC_OBJ_RELEASE(gpu_elem);
@@ -1083,7 +1083,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                                      gpu_device->super.device_index, gpu_device->super.name, task_name,
                                      lru_gpu_elem, lru_gpu_elem->readers, lru_gpu_elem->super.super.obj_reference_count, lru_gpu_elem->original);
                 assert(0 != (lru_gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) );
-                parsec_list_push_back(&gpu_device->gpu_mem_lru, &lru_gpu_elem->super);
+                parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, &lru_gpu_elem->super);
                 gpu_mem_lru_cycling = (NULL == gpu_mem_lru_cycling) ? lru_gpu_elem : gpu_mem_lru_cycling;  /* update the cycle detector */
                 goto find_another_data;
             }
@@ -1098,7 +1098,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                      * might be adding/removing other elements to the list, so we
                      * need to protect all accesses to gpu_mem_lru with the locked version */
                     assert(0 != (lru_gpu_elem->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) );
-                    parsec_list_push_back(&gpu_device->gpu_mem_lru, &lru_gpu_elem->super);
+                    parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, &lru_gpu_elem->super);
                     gpu_mem_lru_cycling = (NULL == gpu_mem_lru_cycling) ? lru_gpu_elem : gpu_mem_lru_cycling;  /* update the cycle detector */
                     goto find_another_data;
                 }
@@ -1124,7 +1124,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                 if( !parsec_atomic_cas_int32(&lru_gpu_elem->readers, 0, -PARSEC_DEVICE_DATA_COPY_ATOMIC_SENTINEL) ) {
                     assert(lru_gpu_elem->readers > 0);
                     /* we can't use this copy, push it back */
-                    parsec_list_push_back(&gpu_device->gpu_mem_lru, &lru_gpu_elem->super);
+                    parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, &lru_gpu_elem->super);
                     gpu_mem_lru_cycling = (NULL == gpu_mem_lru_cycling) ? lru_gpu_elem : gpu_mem_lru_cycling;  /* update the cycle detector */
                     PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                                          "GPU[%d:%s]:%s: Push back LRU-retrieved GPU copy %p [readers %d, ref_count %d] original %p : Concurrent accesses",
@@ -2034,7 +2034,7 @@ parsec_device_callback_complete_push(parsec_device_gpu_module_t   *gpu_device,
                                              source->super.super.obj_reference_count);
                         parsec_list_item_ring_chop((parsec_list_item_t*)source);
                         PARSEC_LIST_ITEM_SINGLETON(source);
-                        parsec_list_push_back(&src_device->gpu_mem_lru, (parsec_list_item_t*)source);
+                        parsec_lifo_push(&src_device->gpu_mem_inbox, (parsec_list_item_t*)source);
                         src_device->data_avail_epoch++;
                     }
                     parsec_atomic_unlock( &source->original->lock );
@@ -2093,7 +2093,7 @@ parsec_device_callback_complete_push(parsec_device_gpu_module_t   *gpu_device,
             PARSEC_DEBUG_VERBOSE(3, parsec_gpu_output_stream,
                                  "GPU[%d:%s]:\tMake copy %p [ref_count %d] available after prefetch from gpu_task %p, ec %p",
                                  gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->super.super.obj_reference_count, gtask, gtask->ec);
-            parsec_list_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
+            parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
         }
         (void)parsec_device_release_resources_prefetch_task(gpu_device, gpu_task);
         return PARSEC_HOOK_RETURN_ASYNC;
@@ -2607,7 +2607,7 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
                                         gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->super.super.obj_reference_count, flow->name);
                     parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
                     PARSEC_LIST_ITEM_SINGLETON(gpu_copy); /* TODO: singleton instead? */
-                    parsec_list_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
+                    parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
                     update_data_epoch = 1;
                     parsec_atomic_unlock(&original->lock);
                     continue;  /* done with this element, go for the next one */
@@ -2617,7 +2617,7 @@ parsec_device_kernel_pop( parsec_device_gpu_module_t   *gpu_device,
                                         gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->super.super.obj_reference_count);
                     parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
                     PARSEC_LIST_ITEM_SINGLETON(gpu_copy); /* TODO: singleton instead? */
-                    parsec_list_push_back(&gpu_device->gpu_mem_owned_lru, (parsec_list_item_t*)gpu_copy);
+                    parsec_list_nolock_push_back(&gpu_device->gpu_mem_owned_lru, (parsec_list_item_t*)gpu_copy);
                     parsec_atomic_unlock(&original->lock);
                     continue;  /* done with this element, go for the next one */
                 }
@@ -2810,14 +2810,14 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
             gpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
             cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
             cpu_copy->version = gpu_copy->version;
-            parsec_list_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
+            parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
         } else {
             PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                                  "GPU copy %p [ref_count %d] moved to the owned LRU in %s",
                                  gpu_copy, gpu_copy->super.super.obj_reference_count, __func__);
             parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
             PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
-            parsec_list_push_back(&gpu_device->gpu_mem_owned_lru, (parsec_list_item_t*)gpu_copy);
+            parsec_list_nolock_push_back(&gpu_device->gpu_mem_owned_lru, (parsec_list_item_t*)gpu_copy);
         }
     }
     return 0;
@@ -2883,7 +2883,7 @@ parsec_device_kernel_cleanout( parsec_device_gpu_module_t *gpu_device,
          */
         this_task->data[i].data_out = cpu_copy;
         if( 0 != (gpu_copy->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) ) {
-            parsec_list_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
+            parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
         }
         parsec_atomic_unlock(&original->lock);
         data_avail_epoch++;
@@ -2997,6 +2997,22 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         return PARSEC_HOOK_RETURN_DISABLE;
 
  check_in_deps:
+
+    /**
+     * Drain the inbox to reclaim lru elements.
+     */
+    if (!parsec_lifo_is_empty(&gpu_device->inbox)) {
+        parsec_gpu_data_copy_t *gpu_copy;
+        while( NULL != (gpu_copy = (parsec_gpu_data_copy_t*)parsec_lifo_pop(&gpu_device->inbox)) ) {
+            PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
+                                 "GPU[%d:%s]:\tPutting inbox copy %p [ref_count %d] attached to %p into the LRU",
+                                 gpu_device->super.device_index, gpu_device->super.name,
+                                 gpu_copy, gpu_copy->super.super.obj_reference_count,
+                                 gpu_copy->original);
+            parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
+        }
+    }
+
     if( NULL != gpu_task ) {
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
                              "GPU[%d:%s]:\tUpload data (if any) for %s",
