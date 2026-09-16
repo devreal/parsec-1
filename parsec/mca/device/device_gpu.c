@@ -1743,7 +1743,6 @@ static inline int parsec_gpu_task_same_chore(parsec_gpu_task_t *task1, parsec_gp
         (NULL == t1->task_class) ||
         (NULL == t2) ||
         (NULL == t2->task_class) ||
-        (t1->selected_device != t2->selected_device) ||
         (t1->selected_chore != t2->selected_chore) ||
         (t1->task_class->incarnations[t1->selected_chore].hook != t2->task_class->incarnations[t2->selected_chore].hook) ) {
         return 0;
@@ -2243,10 +2242,20 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
                  * (aka. returning it to the upper level).
                  */
                 parsec_gpu_stream_push_pending(gpu_device, stream, task);
+                // return success if we have tasks already, otherwise signal to the upper level
+                if (out_ring != NULL) {
+                    *out_task = out_ring;
+                    return PARSEC_HOOK_RETURN_DONE;
+                }
             } else {
                 /* Something else is going on with this task, remove it from the stream queues
                  * and return it to the upper level for final decision on its fate.
                  */
+                if (out_ring != NULL) {
+                    // push the failed tasks back into the pending queue so we can reschedule it
+                    parsec_gpu_stream_push_pending(gpu_device, stream, task);
+                    return PARSEC_HOOK_RETURN_DONE;
+                }
                 *out_task = task;
             }
             return rc;
