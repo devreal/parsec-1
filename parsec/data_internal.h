@@ -79,6 +79,11 @@ struct parsec_data_copy_s {
     parsec_datatype_t            dtt;                /**< the appropriate type for the network engine to send an element */
     parsec_data_copy_alloc_cb   *alloc_cb;           /**< callback to allocate data copy memory */
     parsec_data_copy_release_cb *release_cb;         /**< callback to release data copy memory */
+    int32_t                     pending_writers;     /**< Only meaningful for the host copy (device_index == 0):
+                                                      *   number of in-flight device-to-host evictions currently
+                                                      *   writing into device_private. Protected by original->lock.
+                                                      *   Used to safely defer releasing the host memory of a
+                                                      *   discarded data_t until no such transfer is in flight. */
 };
 
 #define PARSEC_DATA_CREATE_ON_DEMAND ((parsec_data_copy_t*)(intptr_t)(-1))
@@ -103,6 +108,17 @@ PARSEC_DECLSPEC PARSEC_OBJ_CLASS_DECLARATION(parsec_data_copy_t);
  */
 #define PARSEC_DATA_COPY_GET_PTR(DATA) \
     ((DATA) ? (DATA)->device_private : NULL)
+
+/**
+ * Release the host-side memory (device_private) of a discarded host copy
+ * (device_index == 0), provided no device-to-host eviction is currently
+ * writing into it (cpu_copy->pending_writers == 0). No-op if the copy is not
+ * discarded. Must be called with the owning parsec_data_t's lock held. Safe
+ * to call more than once: release_cb is cleared as soon as it has been
+ * invoked once, so this is a no-op on subsequent calls.
+ */
+void
+parsec_data_copy_release_discarded_host_memory( parsec_data_copy_t *cpu_copy );
 
 /** @} */
 

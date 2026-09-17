@@ -277,6 +277,7 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
             PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
             gpu_copy->readers++;
             cpu_copy->version = gpu_copy->version;
+            cpu_copy->pending_writers++;  /* a D2H eviction is about to write into the host buffer */
             d2h_task->data[nb_cleaned].data_out = gpu_copy;
             gpu_copy->data_transfer_status = PARSEC_DATA_STATUS_UNDER_TRANSFER;  /* mark the copy as in transfer */
             parsec_atomic_unlock( &gpu_copy->original->lock );
@@ -367,6 +368,13 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device,
                                  gpu_device->super.device_index, gpu_device->super.name, (void*)task, i, gpu_copy, gpu_copy->original);
             parsec_list_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
         }
+
+        assert(cpu_copy->pending_writers > 0);
+        cpu_copy->pending_writers--;
+        /* if the data was discarded while this eviction was in flight, this is
+         * where we get to finally release the host memory. */
+        parsec_data_copy_release_discarded_host_memory(cpu_copy);
+
         parsec_atomic_unlock(&gpu_copy->original->lock);
     }
     parsec_thread_mempool_free(es->context_mempool, task);

@@ -39,6 +39,7 @@ static void parsec_data_copy_construct(parsec_data_copy_t* obj)
     obj->dtt                  = PARSEC_DATATYPE_NULL;
     obj->alloc_cb             = NULL;
     obj->release_cb           = NULL;
+    obj->pending_writers      = 0;
     PARSEC_DEBUG_VERBOSE(20, parsec_debug_output, "Allocate data copy %p", obj);
 }
 
@@ -594,6 +595,20 @@ parsec_data_destroy( parsec_data_t *data )
     PARSEC_OBJ_RELEASE(data);
 }
 
+/* see data_internal.h for documentation */
+void
+parsec_data_copy_release_discarded_host_memory( parsec_data_copy_t *cpu_copy )
+{
+    assert(0 == cpu_copy->device_index);
+    if( !(cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) ) return;
+    if( cpu_copy->pending_writers > 0 ) return;  /* a device is currently evicting into this buffer */
+    if( NULL != cpu_copy->release_cb ) {
+        cpu_copy->release_cb(cpu_copy, 0);
+        cpu_copy->release_cb = NULL;
+    }
+    cpu_copy->device_private = NULL;
+}
+
 void
 parsec_data_discard( parsec_data_t *data )
 {
@@ -621,6 +636,14 @@ parsec_data_discard( parsec_data_t *data )
         /* release the reference that the host copy had on the data_t to break
         *  the circular reference. */
         PARSEC_OBJ_RELEASE(data);
+
+        /* If no device is currently evicting into this host buffer, we can
+         * release its memory right away instead of waiting for the data_t
+         * (and thus the host copy) to be fully destroyed, which may not
+         * happen until much later (e.g., end of the program) if a device
+         * copy lingers in a device LRU. If a D2H eviction is in flight, the
+         * transfer completion path will release it once it is done. */
+        parsec_data_copy_release_discarded_host_memory(cpu_copy);
     }
 
     /**
