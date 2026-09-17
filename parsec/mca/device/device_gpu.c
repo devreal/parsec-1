@@ -2999,11 +2999,11 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
  check_in_deps:
 
     /**
-     * Drain the inbox to reclaim lru elements.
+     * Drain the gpu_mem_inbox to reclaim lru elements.
      */
-    if (!parsec_lifo_is_empty(&gpu_device->inbox)) {
+    if (!parsec_lifo_is_empty(&gpu_device->gpu_mem_inbox)) {
         parsec_gpu_data_copy_t *gpu_copy;
-        while( NULL != (gpu_copy = (parsec_gpu_data_copy_t*)parsec_lifo_pop(&gpu_device->inbox)) ) {
+        while( NULL != (gpu_copy = (parsec_gpu_data_copy_t*)parsec_lifo_pop(&gpu_device->gpu_mem_inbox)) ) {
             PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                                  "GPU[%d:%s]:\tPutting inbox copy %p [ref_count %d] attached to %p into the LRU",
                                  gpu_device->super.device_index, gpu_device->super.name,
