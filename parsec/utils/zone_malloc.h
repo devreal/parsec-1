@@ -60,10 +60,30 @@ void* zone_malloc_fini(zone_malloc_t** gdata);
 void *zone_malloc(zone_malloc_t *gdata, size_t size);
 
 /**
+ * Allocate `count` regions of sizes[0..count-1] bytes under a single lock
+ * acquisition, instead of `count` separate zone_malloc() calls. Items are
+ * allocated in order, and consecutive items are carved out of the same free
+ * chunk as long as it holds them. When one free chunk covers the whole batch,
+ * the (log-time) chunk search is paid once for the entire batch instead of
+ * once per item. Items of size 0 get a NULL pointer. Returns the number of
+ * leading items actually allocated (0..count); on a short return the caller
+ * owns out_ptrs[0..return value - 1] and is responsible for releasing them
+ * (e.g. via zone_free_batch) if it does not proceed with a partial batch.
+ */
+int zone_malloc_batch(zone_malloc_t *gdata, const size_t *sizes, int count, void **out_ptrs);
+
+/**
  * Release a specific memory zone. When possible this memory zone is
  * merged with similar memory zones surrounding its position.
  */
 void zone_free(zone_malloc_t *gdata, void *add);
+
+/**
+ * Release `count` pointers (previously obtained from zone_malloc() or
+ * zone_malloc_batch()) under a single lock acquisition instead of `count`
+ * separate zone_free() calls. NULL pointers are skipped.
+ */
+void zone_free_batch(zone_malloc_t *gdata, void **ptrs, int count);
 
 /**
  * Computes how much memory is in use

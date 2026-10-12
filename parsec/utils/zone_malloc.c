@@ -109,74 +109,11 @@ void* zone_malloc_fini(zone_malloc_t** gdata)
     return base_ptr;
 }
 
-void *zone_malloc(zone_malloc_t *gdata, size_t size)
-{
-    segment_t *current_segment, *next_segment, *new_segment;
-    int next_tid, current_tid, new_tid;
-    int nb_units;
-    zone_malloc_chunk_list_t* fl;
-
-    nb_units = (size + gdata->unit_size - 1) / gdata->unit_size;
-
-    if (nb_units == 0) {
-        return NULL;
-    }
-
-    parsec_atomic_lock(&gdata->lock);
-    /* try to find the smallest possible element, or one size larger */
-    fl = (zone_malloc_chunk_list_t*) parsec_rbtree_find_or_larger(&gdata->rbtree, nb_units);
-
-    if (NULL == fl) {
-        /* no segment found */
-        parsec_atomic_unlock(&gdata->lock);
-        return NULL;
-    }
-
-    current_segment = (segment_t *)parsec_list_nolock_pop_front(&fl->list);
-    assert(current_segment->nb_units >= nb_units);
-    current_segment->status = SEGMENT_FULL;
-    if (parsec_list_nolock_is_empty(&fl->list)) {
-        /* empty chunk list, remove */
-        parsec_rbtree_remove(&gdata->rbtree, &fl->super);
-        PARSEC_LIST_ITEM_SINGLETON(&fl->super.super);
-        /* put into free list */
-        parsec_lifo_nolock_push(&gdata->rbtree_free_list, &fl->super.super);
-    }
-    current_tid = (current_segment - gdata->segments);
-    if (current_segment->nb_units > nb_units) {
-        /* segment must be split */
-        next_tid = current_tid + current_segment->nb_units;
-
-        /* get the following segment and put it into the rbtree */
-        next_segment = SEGMENT_AT_TID(gdata, next_tid);
-        if( NULL != next_segment ) {
-            next_segment->nb_prev -= nb_units;
-        }
-
-        new_tid = current_tid + nb_units;
-        new_segment = SEGMENT_AT_TID(gdata, new_tid);
-        new_segment->status = SEGMENT_EMPTY;
-        new_segment->nb_prev  = nb_units;
-        new_segment->nb_units = current_segment->nb_units - nb_units;
-
-        fl = (zone_malloc_chunk_list_t*)parsec_rbtree_find(&gdata->rbtree, new_segment->nb_units);
-        if (fl == NULL) {
-            /* create new chunk list and insert into rbtree */
-            fl = allocate_chunk_list(gdata, new_segment->nb_units);
-            parsec_rbtree_insert(&gdata->rbtree, &fl->super);
-        }
-        parsec_list_nolock_push_front(&fl->list, &new_segment->super);
-
-        /* reduce size of current segment */
-        current_segment->nb_units = nb_units;
-    }
-    /* found segment of right size, done */
-    parsec_atomic_unlock(&gdata->lock);
-    return (void*)(gdata->base + (current_tid * gdata->unit_size));
-}
-
-static void remove_segment_from_rbtree(zone_malloc_t *gdata, segment_t *current_segment) {
+/* Remove a free segment from its rbtree-backed chunk list, so it can be
+ * merged with a neighbor or handed out again. */
+static void remove_segment_from_freelist(zone_malloc_t *gdata, segment_t *current_segment) {
     zone_malloc_chunk_list_t *fl;
+
     /* find chunk list */
     fl = (zone_malloc_chunk_list_t*)parsec_rbtree_find(&gdata->rbtree, current_segment->nb_units);
     assert(fl != NULL);
@@ -190,14 +127,173 @@ static void remove_segment_from_rbtree(zone_malloc_t *gdata, segment_t *current_
     }
 }
 
-void zone_free(zone_malloc_t *gdata, void *add)
+/* Insert a free segment into its rbtree-backed chunk list. */
+static void insert_segment_into_freelist(zone_malloc_t *gdata, segment_t *current_segment) {
+    zone_malloc_chunk_list_t *fl;
+
+    PARSEC_LIST_ITEM_SINGLETON(&current_segment->super);
+
+    fl = (zone_malloc_chunk_list_t*)parsec_rbtree_find(&gdata->rbtree, current_segment->nb_units);
+    if (fl == NULL) {
+        /* create new chunk list and insert into rbtree */
+        fl = allocate_chunk_list(gdata, current_segment->nb_units);
+        parsec_rbtree_insert(&gdata->rbtree, &fl->super);
+    }
+    parsec_list_nolock_push_front(&fl->list, &current_segment->super);
+}
+
+static inline int zone_malloc_size_to_units(zone_malloc_t *gdata, size_t size)
+{
+    return (int)((size + gdata->unit_size - 1) / gdata->unit_size);
+}
+
+/*
+ * Carve consecutive items sizes[0], sizes[1], ... (at most `max_count` of
+ * them) out of a SINGLE newly-located free chunk (at most one
+ * rbtree/unit-list lookup), writing the resulting pointers into
+ * out_ptrs[0..k-1] and returning k. Items are placed back to back in the
+ * chunk, in order, until the chunk cannot hold the next item. Items of
+ * size 0 need no memory: their pointer is set to NULL and they count as
+ * allocated. Returns the number of leading zero-size items (possibly 0)
+ * if no free chunk holding the first non-empty item could be found.
+ *
+ * This is the core of both the single-item zone_malloc() (max_count==1)
+ * and zone_malloc_batch(): when the chunk found is big enough to hold
+ * several items, all of them are carved out in one pass with only the
+ * initial lookup paying the rbtree search cost -- callers that need more
+ * than `k` items call this again (see zone_malloc_batch) to look for
+ * another chunk, still under the same lock acquisition.
+ *
+ * Caller must hold gdata->lock.
+ */
+static int zone_malloc_locked(zone_malloc_t *gdata, const size_t *sizes, int max_count, void **out_ptrs)
+{
+    segment_t *current_segment, *next_segment, *leftover;
+    zone_malloc_chunk_list_t* fl;
+    int current_tid, chunk_units, nb_units, k = 0, consumed, leftover_units, prev_units;
+
+    /* leading zero-size items need no memory */
+    while (k < max_count && 0 == (nb_units = zone_malloc_size_to_units(gdata, sizes[k]))) {
+        out_ptrs[k++] = NULL;
+    }
+    if (k == max_count) {
+        return k;
+    }
+
+    /* try to find the smallest possible element for the first item, or one size larger */
+    fl = (zone_malloc_chunk_list_t*) parsec_rbtree_find_or_larger(&gdata->rbtree, nb_units);
+    if (NULL == fl) {
+        return k; /* no segment found */
+    }
+
+    current_segment = (segment_t *)parsec_list_nolock_pop_front(&fl->list);
+    assert(current_segment->nb_units >= nb_units);
+    if (parsec_list_nolock_is_empty(&fl->list)) {
+        /* empty chunk list, remove */
+        parsec_rbtree_remove(&gdata->rbtree, &fl->super);
+        PARSEC_LIST_ITEM_SINGLETON(&fl->super.super);
+        /* put into free list */
+        parsec_lifo_nolock_push(&gdata->rbtree_free_list, &fl->super.super);
+    }
+
+    current_tid  = (int)(current_segment - gdata->segments);
+    chunk_units  = current_segment->nb_units;
+    prev_units   = current_segment->nb_prev;
+    consumed     = 0;
+
+    /* carve consecutive items as long as the chunk holds them, capped at max_count */
+    while (k < max_count) {
+        nb_units = zone_malloc_size_to_units(gdata, sizes[k]);
+        if (0 == nb_units) {
+            out_ptrs[k++] = NULL;
+            continue;
+        }
+        if (consumed + nb_units > chunk_units) {
+            break;
+        }
+        segment_t *piece = SEGMENT_AT_TID(gdata, current_tid + consumed);
+        piece->status   = SEGMENT_FULL;
+        piece->nb_units = nb_units;
+        piece->nb_prev  = prev_units;
+        out_ptrs[k++] = (void*)(gdata->base + ((size_t)(current_tid + consumed) * gdata->unit_size));
+        prev_units = nb_units;
+        consumed  += nb_units;
+    }
+
+    /* fix up whatever follows the whole original chunk: its new immediate
+     * predecessor is either the leftover remainder, or (if the chunk was
+     * consumed exactly) the last carved piece -- never the original chunk,
+     * which no longer exists as a single run once more than one item was carved. */
+    leftover_units  = chunk_units - consumed;
+    next_segment    = SEGMENT_AT_TID(gdata, current_tid + chunk_units);
+    if (leftover_units > 0) {
+        if (NULL != next_segment) next_segment->nb_prev = leftover_units;
+        leftover = SEGMENT_AT_TID(gdata, current_tid + consumed);
+        leftover->status   = SEGMENT_EMPTY;
+        leftover->nb_prev  = prev_units;
+        leftover->nb_units = leftover_units;
+        insert_segment_into_freelist(gdata, leftover);
+    } else if (NULL != next_segment) {
+        next_segment->nb_prev = prev_units;
+    }
+
+    return k;
+}
+
+void *zone_malloc(zone_malloc_t *gdata, size_t size)
+{
+    void *ptr = NULL;
+
+    if (0 == size) {
+        return NULL;
+    }
+
+    parsec_atomic_lock(&gdata->lock);
+    int k = zone_malloc_locked(gdata, &size, 1, &ptr);
+    parsec_atomic_unlock(&gdata->lock);
+    return (1 == k) ? ptr : NULL;
+}
+
+/*
+ * Allocate `count` regions of sizes[0..count-1] bytes under a single lock
+ * acquisition instead of `count` separate ones. Items are allocated in
+ * order; consecutive items are carved back to back out of the same free
+ * chunk as long as it holds them. When a single free chunk covers the
+ * whole batch, this pays the rbtree search cost once instead of `count`
+ * times; a fragmented pool falls back to one search per distinct chunk
+ * needed to cover the batch (never more than `count`). Items of size 0
+ * get a NULL pointer.
+ *
+ * Returns the number of leading items actually allocated (0..count). On a
+ * short return, out_ptrs[0..return value - 1] are valid allocations the
+ * caller is responsible for freeing (e.g. via zone_free_batch) if it decides
+ * not to proceed with a partially-satisfied batch.
+ */
+int zone_malloc_batch(zone_malloc_t *gdata, const size_t *sizes, int count, void **out_ptrs)
+{
+    int done = 0;
+
+    if (count <= 0) {
+        return 0;
+    }
+
+    parsec_atomic_lock(&gdata->lock);
+    while (done < count) {
+        int k = zone_malloc_locked(gdata, sizes + done, count - done, out_ptrs + done);
+        if (0 == k) break;
+        done += k;
+    }
+    parsec_atomic_unlock(&gdata->lock);
+    return done;
+}
+
+/* Free one segment; caller must hold gdata->lock. */
+static void zone_free_locked(zone_malloc_t *gdata, void *add)
 {
     segment_t *current_segment, *next_segment, *prev_segment;
     int current_tid, next_tid, prev_tid;
     off_t offset;
-    zone_malloc_chunk_list_t *fl;
 
-    parsec_atomic_lock(&gdata->lock);
     offset = (char*)add -gdata->base;
     assert( (offset % gdata->unit_size) == 0);
     current_tid = offset / gdata->unit_size;
@@ -205,13 +301,11 @@ void zone_free(zone_malloc_t *gdata, void *add)
 
     if( NULL == current_segment ) {
         zone_malloc_error("address to free not allocated\n");
-        parsec_atomic_unlock(&gdata->lock);
         return;
     }
 
     if( SEGMENT_EMPTY == current_segment->status ) {
         zone_malloc_error("double free (or other buffer overflow) error in ZONE allocation");
-        parsec_atomic_unlock(&gdata->lock);
         return;
     }
 
@@ -225,7 +319,7 @@ void zone_free(zone_malloc_t *gdata, void *add)
     next_segment = SEGMENT_AT_TID(gdata, next_tid);
 
     if (NULL != prev_segment && prev_segment->status == SEGMENT_EMPTY) {
-        remove_segment_from_rbtree(gdata, prev_segment);
+        remove_segment_from_freelist(gdata, prev_segment);
         /* We can merge prev and current */
         if( NULL != next_segment ) {
             next_segment->nb_prev += prev_segment->nb_units;
@@ -238,7 +332,7 @@ void zone_free(zone_malloc_t *gdata, void *add)
     }
 
     if (NULL != next_segment && next_segment->status == SEGMENT_EMPTY) {
-        remove_segment_from_rbtree(gdata, next_segment);
+        remove_segment_from_freelist(gdata, next_segment);
         /* We can merge current and next */
         next_tid += next_segment->nb_units;
         current_segment->nb_units += next_segment->nb_units;
@@ -248,15 +342,25 @@ void zone_free(zone_malloc_t *gdata, void *add)
         }
     }
 
-    /* add the chunk into the RB tree */
-    fl = (zone_malloc_chunk_list_t*)parsec_rbtree_find(&gdata->rbtree, current_segment->nb_units);
-    if (fl == NULL) {
-        /* no chunk list, create a new entry */
-        fl = allocate_chunk_list(gdata, current_segment->nb_units);
-        parsec_rbtree_insert(&gdata->rbtree, &fl->super);
+    insert_segment_into_freelist(gdata, current_segment);
+}
+
+void zone_free(zone_malloc_t *gdata, void *add)
+{
+    parsec_atomic_lock(&gdata->lock);
+    zone_free_locked(gdata, add);
+    parsec_atomic_unlock(&gdata->lock);
+}
+
+/* Free `count` pointers under a single lock acquisition instead of `count`
+ * separate ones. NULL pointers (zero-size items of a batch) are skipped. */
+void zone_free_batch(zone_malloc_t *gdata, void **ptrs, int count)
+{
+    parsec_atomic_lock(&gdata->lock);
+    for (int i = 0; i < count; i++) {
+        if (NULL == ptrs[i]) continue;
+        zone_free_locked(gdata, ptrs[i]);
     }
-    assert(fl != NULL);
-    parsec_list_nolock_push_front(&fl->list, &current_segment->super);
     parsec_atomic_unlock(&gdata->lock);
 }
 
