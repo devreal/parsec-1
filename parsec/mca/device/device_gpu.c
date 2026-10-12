@@ -2310,20 +2310,23 @@ parsec_gpu_task_ring_next_unit( parsec_gpu_task_t* iter,
 /**
  * Extract the next ring of tasks to progress from the pending queue of @p stream.
  * Without batching, the ring contains a single task. With batching, the ring
- * gathers up to PARSEC_DEVICE_MAX_BATCH_SIZE consecutive pending tasks whose
- * selected incarnation allows batching on @p gpu_device and that share the
- * incarnation of the first task. A task that is not batchable always forms a
- * ring of its own.
+ * gathers up to PARSEC_DEVICE_MAX_BATCH_SIZE pending tasks whose selected
+ * incarnation allows batching on @p gpu_device and that share the incarnation
+ * of the first task. Pending tasks that do not match are skipped and left in
+ * the queue, in order, for the following rings. A task that is not batchable
+ * always forms a ring of its own.
  */
 static inline parsec_gpu_task_t*
 parsec_device_stream_grab_ring( parsec_device_gpu_module_t* gpu_device,
                                 parsec_gpu_exec_stream_t* stream,
                                 bool batch )
 {
+    parsec_list_t *fifo_pending = stream->fifo_pending;
+    parsec_list_item_t *item, *next;
     parsec_gpu_task_t *ring, *task;
     int nb_tasks = 1;
 
-    ring = (parsec_gpu_task_t*)parsec_list_nolock_pop_front(stream->fifo_pending);
+    ring = (parsec_gpu_task_t*)parsec_list_nolock_pop_front(fifo_pending);
     if( NULL == ring )
         return NULL;
     PARSEC_LIST_ITEM_SINGLETON((parsec_list_item_t*)ring);
@@ -2332,18 +2335,19 @@ parsec_device_stream_grab_ring( parsec_device_gpu_module_t* gpu_device,
         !parsec_gpu_task_selected_chore_allows_batch(ring->ec, (parsec_device_module_t*)gpu_device) )
         return ring;
 
-    while( nb_tasks < PARSEC_DEVICE_MAX_BATCH_SIZE ) {
-        task = (parsec_gpu_task_t*)parsec_list_nolock_pop_front(stream->fifo_pending);
-        if( NULL == task )
-            break;
+    for( item = (parsec_list_item_t*)fifo_pending->ghost_element.list_next;
+         (item != &fifo_pending->ghost_element) && (nb_tasks < PARSEC_DEVICE_MAX_BATCH_SIZE);
+         item = next ) {
+        next = (parsec_list_item_t*)item->list_next;
+        task = (parsec_gpu_task_t*)item;
         if( !parsec_gpu_task_selected_chore_allows_batch(task->ec, (parsec_device_module_t*)gpu_device) ||
             !parsec_gpu_task_same_chore(task, ring) ) {
-            /* the task does not match the current batch, leave it for the next one */
-            parsec_list_nolock_push_front(stream->fifo_pending, (parsec_list_item_t*)task);
-            break;
+            /* the task does not match the current batch, leave it for a following one */
+            continue;
         }
-        PARSEC_LIST_ITEM_SINGLETON((parsec_list_item_t*)task);
-        parsec_list_item_ring_push(&ring->list_item, &task->list_item);
+        (void)parsec_list_nolock_remove(fifo_pending, item);
+        PARSEC_LIST_ITEM_SINGLETON(item);
+        parsec_list_item_ring_push(&ring->list_item, item);
         nb_tasks++;
     }
     return ring;
