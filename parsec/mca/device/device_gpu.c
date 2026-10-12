@@ -1944,36 +1944,21 @@ static inline int parsec_gpu_task_same_chore(parsec_gpu_task_t *task1, parsec_gp
     return 1;
 }
 
-int
-parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
-                              parsec_gpu_task_t *batch_head,
-                              parsec_gpu_task_batch_cb_t callback,
-                              void *callback_data)
+/* Append the tasks of fifo_pending accepted by callback to batch_head, and
+ * account for them in *nb_tasks. Returns PARSEC_SUCCESS, or the negative
+ * callback error code (in which case *nb_tasks still accounts for the tasks
+ * appended before the error). */
+static int
+parsec_gpu_task_collect_batch_from(parsec_list_t *fifo_pending,
+                                   parsec_device_module_t *device,
+                                   parsec_gpu_task_t *batch_head,
+                                   parsec_gpu_task_batch_cb_t callback,
+                                   void *callback_data,
+                                   int *nb_tasks)
 {
-    parsec_list_t *fifo_pending;
     parsec_list_item_t *item, *next;
-    parsec_task_t *head_task;
-    parsec_device_module_t *device;
-    int nb_tasks = 0;
     int rc;
 
-    assert(NULL != gpu_stream);
-    assert(NULL != batch_head);
-    assert(NULL != callback);
-
-    parsec_list_item_singleton(&batch_head->list_item);
-
-    head_task = batch_head->ec;
-    if( (NULL == head_task) || (NULL == head_task->selected_device) ) {
-        return nb_tasks;
-    }
-    device = head_task->selected_device;
-    if( !parsec_mca_device_type_supports_batch(device->type) ||
-        !parsec_gpu_task_selected_chore_allows_batch(head_task, device) ) {
-        return nb_tasks;
-    }
-
-    fifo_pending = gpu_stream->fifo_pending;
     assert(NULL != fifo_pending);
 
     for(item = (parsec_list_item_t *)fifo_pending->ghost_element.list_next;
@@ -1993,7 +1978,69 @@ parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
         if( 0 == rc ) {
             (void)parsec_list_nolock_remove(fifo_pending, item);
             (void)parsec_list_item_ring_push(&batch_head->list_item, item);
-            nb_tasks++;
+            (*nb_tasks)++;
+        }
+    }
+    return PARSEC_SUCCESS;
+}
+
+int
+parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
+                              parsec_gpu_task_t *batch_head,
+                              parsec_gpu_task_batch_cb_t callback,
+                              void *callback_data)
+{
+    parsec_device_gpu_module_t *gpu_device;
+    parsec_task_t *head_task;
+    parsec_device_module_t *device;
+    int i, first = -1, nb_exec_streams, nb_tasks = 0;
+    int rc;
+
+    assert(NULL != gpu_stream);
+    assert(NULL != batch_head);
+    assert(NULL != callback);
+
+    parsec_list_item_singleton(&batch_head->list_item);
+
+    head_task = batch_head->ec;
+    if( (NULL == head_task) || (NULL == head_task->selected_device) ) {
+        return nb_tasks;
+    }
+    device = head_task->selected_device;
+    if( !parsec_mca_device_type_supports_batch(device->type) ||
+        !parsec_gpu_task_selected_chore_allows_batch(head_task, device) ) {
+        return nb_tasks;
+    }
+
+    /* Start with the pending tasks of the calling stream */
+    rc = parsec_gpu_task_collect_batch_from(gpu_stream->fifo_pending, device, batch_head,
+                                            callback, callback_data, &nb_tasks);
+    if( rc < 0 ) {
+        return rc;
+    }
+
+    /* Then steal from the other execution streams of the device (exec_stream[2..]).
+     * Tasks pending on an execution stream have completed the push stage, so they
+     * can execute on any execution stream. All pending queues are only accessed
+     * by the thread managing the device. */
+    gpu_device = (parsec_device_gpu_module_t*)device;
+    nb_exec_streams = gpu_device->num_exec_streams - 2;
+    for( i = 0; i < nb_exec_streams; i++ ) {
+        if( gpu_device->exec_stream[2+i] == gpu_stream ) {
+            first = i;
+            break;
+        }
+    }
+    if( first < 0 ) {
+        /* not called from an execution stream, don't steal */
+        return nb_tasks;
+    }
+    for( i = 1; i < nb_exec_streams; i++ ) {
+        parsec_gpu_exec_stream_t *stream = gpu_device->exec_stream[2 + (first + i) % nb_exec_streams];
+        rc = parsec_gpu_task_collect_batch_from(stream->fifo_pending, device, batch_head,
+                                                callback, callback_data, &nb_tasks);
+        if( rc < 0 ) {
+            return rc;
         }
     }
 

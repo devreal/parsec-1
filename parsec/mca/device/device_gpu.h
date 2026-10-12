@@ -352,12 +352,17 @@ parsec_gpu_task_t* parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_de
 int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_gpu_task_t *w2r_task, parsec_execution_stream_t *es);
 
 /**
- * Iterate over gpu_stream->fifo_pending and append accepted tasks to
- * batch_head. The callback receives each pending candidate, the task passed to
+ * Iterate over the pending tasks of the device's execution streams and append
+ * accepted tasks to batch_head. The pending queue of gpu_stream is scanned
+ * first, followed by the pending queues of the other execution streams of the
+ * device (only if gpu_stream is itself an execution stream), so that batches
+ * are not limited to the tasks assigned to gpu_stream. Stolen tasks execute on
+ * gpu_stream as part of batch_head's ring.
+ * The callback receives each pending candidate, the task passed to
  * the submit function, and user data. The callback should return 0 to append
  * the candidate to batch_head's ring, a positive value to leave it pending, or
  * a negative error code to stop the iteration.
- * The callback must not modify gpu_stream->fifo_pending directly.
+ * The callback must not modify the pending queues directly.
  * If batching is disabled, unsupported by the head task's selected device, or
  * not enabled on batch_head's selected incarnation, no iteration is performed
  * and batch_head remains a singleton. Pending tasks whose selected incarnation
@@ -367,7 +372,7 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_
  * Returns the number of additional tasks appended to batch_head's ring on
  * success, or the negative callback error code. If an error is returned, tasks
  * already accepted remain attached to batch_head and the remaining candidates
- * stay in fifo_pending.
+ * stay in their pending queues.
  */
 int parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
                                   parsec_gpu_task_t *batch_head,
