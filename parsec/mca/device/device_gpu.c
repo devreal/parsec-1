@@ -2343,6 +2343,16 @@ parsec_device_callback_complete_push(parsec_device_gpu_module_t   *gpu_device,
 }
 
 /**
+ * Returns true if tasks are in flight or pending on @p stream.
+ */
+static inline bool
+parsec_device_stream_has_tasks( parsec_gpu_exec_stream_t* stream )
+{
+    return (NULL != stream->tasks[stream->end]) ||
+           !parsec_list_nolock_is_empty(stream->fifo_pending);
+}
+
+/**
  * Retrieve the task (or task ring) attached to the oldest event of @p stream,
  * if that event has completed.
  *
@@ -3604,9 +3614,12 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
             goto check_in_deps;
         }
 
-        /* TODO: check this */
-        /* If we can extract data go for it, otherwise try to drain the pending tasks */
-        if (active_w2r_tasks == 0) {
+        /* If we can extract data go for it, otherwise try to drain the pending tasks.
+         * Executing tasks release memory once they complete, so delay the eviction
+         * while the next execution stream still has work, and start pushing data out
+         * as soon as it runs dry. */
+        if ((active_w2r_tasks == 0) &&
+            !parsec_device_stream_has_tasks(gpu_device->exec_stream[2 + (exec_stream + 1) % (gpu_device->num_exec_streams - 2)])) {
             gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
             if( NULL != gpu_task ) {
                 active_w2r_tasks++;
