@@ -21,10 +21,12 @@ BEGIN_C_DECLS
 #define SEGMENT_EMPTY      1
 #define SEGMENT_FULL       2
 #define SEGMENT_UNDEFINED  3
+#define SEGMENT_FREEING    4  /* released by zone_free(), not yet merged into the free segments */
+#define SEGMENT_MERGED     5  /* free, merged while draining released segments, not yet in a chunk list */
 
 typedef struct segment {
     parsec_list_item_t super;
-    int status;     /* True if this segment is full, false if it is free */
+    int32_t status; /* One of the SEGMENT_* states */
     int nb_units;   /* Number of units on this segment */
     int nb_prev;    /* Number of units on the segment before */
 } segment_t;
@@ -38,6 +40,7 @@ typedef struct zone_malloc_s {
     parsec_atomic_lock_t lock;
     parsec_rbtree_t rbtree;          /* RB tree tracking chunks of free segments */
     parsec_lifo_t rbtree_free_list;
+    parsec_lifo_t pending_free;      /* Segments released without holding the lock */
 } zone_malloc_t;
 
 
@@ -75,13 +78,17 @@ int zone_malloc_batch(zone_malloc_t *gdata, const size_t *sizes, int count, void
 /**
  * Release a specific memory zone. When possible this memory zone is
  * merged with similar memory zones surrounding its position.
+ * This function is lock-free: the zone is queued and only merged back into
+ * the free segments by the next allocation (or zone_in_use()/zone_debug()),
+ * so that concurrent releases do not contend with the allocating thread.
  */
 void zone_free(zone_malloc_t *gdata, void *add);
 
 /**
  * Release `count` pointers (previously obtained from zone_malloc() or
- * zone_malloc_batch()) under a single lock acquisition instead of `count`
- * separate zone_free() calls. NULL pointers are skipped.
+ * zone_malloc_batch()) with a single atomic operation instead of `count`
+ * separate zone_free() calls. NULL pointers are skipped. Like zone_free(),
+ * this function is lock-free.
  */
 void zone_free_batch(zone_malloc_t *gdata, void **ptrs, int count);
 

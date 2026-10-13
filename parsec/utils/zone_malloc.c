@@ -17,12 +17,16 @@ typedef struct zone_malloc_chunk_list_t {
     parsec_rbtree_node_t super;
     parsec_list_t list; /* list of free segments of specific size */
     int nb_units;       /* size of free segments */
+    int marked_empty;   /* the list became empty while draining released segments */
+    struct zone_malloc_chunk_list_t *next_empty; /* next list marked empty in the same drain */
 } zone_malloc_chunk_list_t;
 
 static inline void
 zone_malloc_chunk_list_construct( zone_malloc_chunk_list_t* item )
 {
     item->nb_units = 0;
+    item->marked_empty = 0;
+    item->next_empty = NULL;
     PARSEC_OBJ_CONSTRUCT(&item->list, parsec_list_t);
 }
 
@@ -42,6 +46,8 @@ static zone_malloc_chunk_list_t* allocate_chunk_list(zone_malloc_t *gdata, int n
     fl->nb_units = nb_units;
     return fl;
 }
+
+static void zone_drain_pending_free_locked(zone_malloc_t *gdata);
 
 static inline void zone_malloc_error(const char *msg)
 {
@@ -76,6 +82,7 @@ zone_malloc_t* zone_malloc_init(void* base_ptr, int _max_segment, size_t _unit_s
     parsec_atomic_lock_init(&gdata->lock);
     parsec_rbtree_init(&gdata->rbtree, offsetof(zone_malloc_chunk_list_t, nb_units));
     PARSEC_OBJ_CONSTRUCT(&gdata->rbtree_free_list, parsec_lifo_t);
+    PARSEC_OBJ_CONSTRUCT(&gdata->pending_free, parsec_lifo_t);
     for(int i = 0; i < _max_segment; i++) {
         SEGMENT_AT_TID(gdata, i)->status = SEGMENT_UNDEFINED;
         PARSEC_OBJ_CONSTRUCT(&SEGMENT_AT_TID(gdata, i)->super, parsec_list_item_t);
@@ -97,6 +104,9 @@ void* zone_malloc_fini(zone_malloc_t** gdata)
 {
     void* base_ptr = (*gdata)->base;
 
+    /* the pending segments live in the segment array, just forget about them */
+    (void)parsec_lifo_detach_chain(&(*gdata)->pending_free);
+    PARSEC_OBJ_DESTRUCT(&(*gdata)->pending_free);
     free( (*gdata)->segments );
 
     (*gdata)->max_segment = 0;
@@ -110,8 +120,13 @@ void* zone_malloc_fini(zone_malloc_t** gdata)
 }
 
 /* Remove a free segment from its rbtree-backed chunk list, so it can be
- * merged with a neighbor or handed out again. */
-static void remove_segment_from_freelist(zone_malloc_t *gdata, segment_t *current_segment) {
+ * merged with a neighbor. A chunk list that becomes empty is not removed
+ * from the rbtree right away: merging released segments frequently empties
+ * a chunk list and refills it shortly after, so the list is only marked and
+ * added to *empty_lists, and removed by zone_release_empty_chunk_lists() if
+ * it is still empty once all released segments have been merged. */
+static void remove_segment_from_freelist(zone_malloc_t *gdata, segment_t *current_segment,
+                                         zone_malloc_chunk_list_t **empty_lists) {
     zone_malloc_chunk_list_t *fl;
 
     /* find chunk list */
@@ -119,11 +134,30 @@ static void remove_segment_from_freelist(zone_malloc_t *gdata, segment_t *curren
     assert(fl != NULL);
     /* remove from list */
     parsec_list_nolock_remove(&fl->list, &current_segment->super);
-    if (parsec_list_nolock_is_empty(&fl->list)) {
-        /* empty chunk list, remove */
-        parsec_rbtree_remove(&gdata->rbtree, &fl->super);
-        /* put into free list */
-        parsec_lifo_nolock_push(&gdata->rbtree_free_list, &fl->super.super);
+    if (!fl->marked_empty && parsec_list_nolock_is_empty(&fl->list)) {
+        fl->marked_empty = 1;
+        fl->next_empty = *empty_lists;
+        *empty_lists = fl;
+    }
+}
+
+/* Remove the chunk lists marked by remove_segment_from_freelist() that are
+ * still empty from the rbtree. Must be called before the next allocation, as
+ * allocations expect all chunk lists in the rbtree to be non-empty. */
+static void zone_release_empty_chunk_lists(zone_malloc_t *gdata, zone_malloc_chunk_list_t *empty_lists) {
+    zone_malloc_chunk_list_t *fl;
+
+    while (NULL != empty_lists) {
+        fl = empty_lists;
+        empty_lists = fl->next_empty;
+        fl->next_empty = NULL;
+        fl->marked_empty = 0;
+        if (parsec_list_nolock_is_empty(&fl->list)) {
+            parsec_rbtree_remove(&gdata->rbtree, &fl->super);
+            PARSEC_LIST_ITEM_SINGLETON(&fl->super.super);
+            /* put into free list */
+            parsec_lifo_nolock_push(&gdata->rbtree_free_list, &fl->super.super);
+        }
     }
 }
 
@@ -249,6 +283,7 @@ void *zone_malloc(zone_malloc_t *gdata, size_t size)
     }
 
     parsec_atomic_lock(&gdata->lock);
+    zone_drain_pending_free_locked(gdata);
     int k = zone_malloc_locked(gdata, &size, 1, &ptr);
     parsec_atomic_unlock(&gdata->lock);
     return (1 == k) ? ptr : NULL;
@@ -278,6 +313,7 @@ int zone_malloc_batch(zone_malloc_t *gdata, const size_t *sizes, int count, void
     }
 
     parsec_atomic_lock(&gdata->lock);
+    zone_drain_pending_free_locked(gdata);
     while (done < count) {
         int k = zone_malloc_locked(gdata, sizes + done, count - done, out_ptrs + done);
         if (0 == k) break;
@@ -287,30 +323,26 @@ int zone_malloc_batch(zone_malloc_t *gdata, const size_t *sizes, int count, void
     return done;
 }
 
-/* Free one segment; caller must hold gdata->lock. */
-static void zone_free_locked(zone_malloc_t *gdata, void *add)
+/* Merge a segment released by zone_free() with its free neighbors; caller
+ * must hold gdata->lock. The resulting free segment is not inserted into the
+ * chunk lists: segments released next to each other would otherwise be
+ * inserted and removed again for every intermediate size. Instead, it is
+ * marked SEGMENT_MERGED and kept in to_insert, from which it is removed if
+ * it gets merged into its predecessor; the caller inserts the remaining
+ * segments once all released segments are merged. Chunk lists that become
+ * empty are added to *empty_lists (see remove_segment_from_freelist()). */
+static void zone_free_locked(zone_malloc_t *gdata, segment_t *current_segment,
+                             parsec_list_t *to_insert,
+                             zone_malloc_chunk_list_t **empty_lists)
 {
-    segment_t *current_segment, *next_segment, *prev_segment;
+    segment_t *next_segment, *prev_segment;
     int current_tid, next_tid, prev_tid;
-    off_t offset;
 
-    offset = (char*)add -gdata->base;
-    assert( (offset % gdata->unit_size) == 0);
-    current_tid = offset / gdata->unit_size;
-    current_segment = SEGMENT_AT_TID(gdata, current_tid);
-
-    if( NULL == current_segment ) {
-        zone_malloc_error("address to free not allocated\n");
-        return;
-    }
-
-    if( SEGMENT_EMPTY == current_segment->status ) {
-        zone_malloc_error("double free (or other buffer overflow) error in ZONE allocation");
-        return;
-    }
+    assert(SEGMENT_FREEING == current_segment->status);
+    current_tid = (int)(current_segment - gdata->segments);
 
     /* check if we can merge segments */
-    current_segment->status = SEGMENT_EMPTY;
+    current_segment->status = SEGMENT_MERGED;
 
     prev_tid = current_tid - current_segment->nb_prev;
     prev_segment = SEGMENT_AT_TID(gdata, prev_tid);
@@ -318,8 +350,13 @@ static void zone_free_locked(zone_malloc_t *gdata, void *add)
     next_tid = current_tid + current_segment->nb_units;
     next_segment = SEGMENT_AT_TID(gdata, next_tid);
 
-    if (NULL != prev_segment && prev_segment->status == SEGMENT_EMPTY) {
-        remove_segment_from_freelist(gdata, prev_segment);
+    if (NULL != prev_segment &&
+        (prev_segment->status == SEGMENT_EMPTY || prev_segment->status == SEGMENT_MERGED)) {
+        if (prev_segment->status == SEGMENT_EMPTY) {
+            remove_segment_from_freelist(gdata, prev_segment, empty_lists);
+            prev_segment->status = SEGMENT_MERGED;
+            parsec_list_nolock_push_back(to_insert, &prev_segment->super);
+        }
         /* We can merge prev and current */
         if( NULL != next_segment ) {
             next_segment->nb_prev += prev_segment->nb_units;
@@ -329,10 +366,17 @@ static void zone_free_locked(zone_malloc_t *gdata, void *add)
         /* Pretend we are now our prev, so that we merge with next if needed */
         current_segment = prev_segment;
         current_tid     = prev_tid;
+    } else {
+        parsec_list_nolock_push_back(to_insert, &current_segment->super);
     }
 
-    if (NULL != next_segment && next_segment->status == SEGMENT_EMPTY) {
-        remove_segment_from_freelist(gdata, next_segment);
+    if (NULL != next_segment &&
+        (next_segment->status == SEGMENT_EMPTY || next_segment->status == SEGMENT_MERGED)) {
+        if (next_segment->status == SEGMENT_EMPTY) {
+            remove_segment_from_freelist(gdata, next_segment, empty_lists);
+        } else {
+            parsec_list_nolock_remove(to_insert, &next_segment->super);
+        }
         /* We can merge current and next */
         next_tid += next_segment->nb_units;
         current_segment->nb_units += next_segment->nb_units;
@@ -341,27 +385,96 @@ static void zone_free_locked(zone_malloc_t *gdata, void *add)
             next_segment->nb_prev = current_segment->nb_units;
         }
     }
+}
 
-    insert_segment_into_freelist(gdata, current_segment);
+/* Merge all segments released by zone_free() since the last call back into
+ * the free segments; caller must hold gdata->lock. */
+static void zone_drain_pending_free_locked(zone_malloc_t *gdata)
+{
+    parsec_list_item_t *item, *next;
+    zone_malloc_chunk_list_t *empty_lists = NULL;
+    parsec_list_t to_insert;
+    segment_t *current_segment;
+
+    if (parsec_lifo_is_empty(&gdata->pending_free)) {
+        return;
+    }
+    item = parsec_lifo_detach_chain(&gdata->pending_free);
+    /* make the links written by the releasing threads visible */
+    parsec_atomic_rmb();
+    PARSEC_OBJ_CONSTRUCT(&to_insert, parsec_list_t);
+    while (NULL != item) {
+        next = (parsec_list_item_t*)item->list_next;
+        zone_free_locked(gdata, (segment_t*)item, &to_insert, &empty_lists);
+        item = next;
+    }
+    /* insert the merged free segments, possibly refilling chunk lists marked empty */
+    while (NULL != (current_segment = (segment_t*)parsec_list_nolock_pop_front(&to_insert))) {
+        current_segment->status = SEGMENT_EMPTY;
+        insert_segment_into_freelist(gdata, current_segment);
+    }
+    PARSEC_OBJ_DESTRUCT(&to_insert);
+    zone_release_empty_chunk_lists(gdata, empty_lists);
+}
+
+/* Find the segment of an allocated address and mark it as being released.
+ * Returns NULL (after reporting the error) if the address is not a currently
+ * allocated segment. Does not require gdata->lock. */
+static segment_t *zone_free_mark(zone_malloc_t *gdata, void *add)
+{
+    segment_t *current_segment;
+    off_t offset;
+
+    offset = (char*)add - gdata->base;
+    assert( (offset % gdata->unit_size) == 0);
+    current_segment = SEGMENT_AT_TID(gdata, (int)(offset / gdata->unit_size));
+
+    if( NULL == current_segment ) {
+        zone_malloc_error("address to free not allocated\n");
+        return NULL;
+    }
+
+    /* Only one release can switch a segment from FULL to FREEING, which detects
+     * double frees without holding the lock. The allocator never changes the
+     * status of a FULL segment, it only checks whether a neighbor is EMPTY. */
+    if( !parsec_atomic_cas_int32(&current_segment->status, SEGMENT_FULL, SEGMENT_FREEING) ) {
+        zone_malloc_error("double free (or other buffer overflow) error in ZONE allocation");
+        return NULL;
+    }
+    return current_segment;
 }
 
 void zone_free(zone_malloc_t *gdata, void *add)
 {
-    parsec_atomic_lock(&gdata->lock);
-    zone_free_locked(gdata, add);
-    parsec_atomic_unlock(&gdata->lock);
+    segment_t *current_segment = zone_free_mark(gdata, add);
+
+    if( NULL != current_segment ) {
+        /* Defer the merge to the next allocation instead of contending for the lock */
+        parsec_lifo_push(&gdata->pending_free, &current_segment->super);
+    }
 }
 
-/* Free `count` pointers under a single lock acquisition instead of `count`
- * separate ones. NULL pointers (zero-size items of a batch) are skipped. */
+/* Free `count` pointers with a single push into the pending list instead of
+ * `count` separate ones. NULL pointers (zero-size items of a batch) are skipped. */
 void zone_free_batch(zone_malloc_t *gdata, void **ptrs, int count)
 {
-    parsec_atomic_lock(&gdata->lock);
+    parsec_list_item_t *ring = NULL;
+    segment_t *current_segment;
+
     for (int i = 0; i < count; i++) {
         if (NULL == ptrs[i]) continue;
-        zone_free_locked(gdata, ptrs[i]);
+        current_segment = zone_free_mark(gdata, ptrs[i]);
+        if (NULL == current_segment) continue;
+        PARSEC_LIST_ITEM_SINGLETON(&current_segment->super);
+        if (NULL == ring) {
+            ring = &current_segment->super;
+        } else {
+            parsec_list_item_ring_push(ring, &current_segment->super);
+        }
     }
-    parsec_atomic_unlock(&gdata->lock);
+    if (NULL != ring) {
+        parsec_lifo_chain(&gdata->pending_free, ring);
+    }
 }
 
 size_t zone_in_use(zone_malloc_t *gdata)
@@ -370,11 +483,13 @@ size_t zone_in_use(zone_malloc_t *gdata)
     segment_t *current_segment;
     int current_tid;
     parsec_atomic_lock(&gdata->lock);
+    zone_drain_pending_free_locked(gdata);
     /* check segments */
     for(current_tid = 0;
         (current_segment = SEGMENT_AT_TID(gdata, current_tid)) != NULL;
         current_tid += current_segment->nb_units) {
-        if( current_segment->status == SEGMENT_FULL ) {
+        /* segments released concurrently (FREEING) are still in use until merged */
+        if( current_segment->status != SEGMENT_EMPTY ) {
             ret += gdata->unit_size * current_segment->nb_units;
         }
     }
@@ -403,6 +518,7 @@ size_t zone_debug(zone_malloc_t *gdata, int level, int output_id, const char *pr
     size_t ret = 0;
 
     parsec_atomic_lock(&gdata->lock);
+    zone_drain_pending_free_locked(gdata);
     for(current_tid = 0;
         (current_segment = SEGMENT_AT_TID(gdata, current_tid)) != NULL;
         current_tid += current_segment->nb_units) {
