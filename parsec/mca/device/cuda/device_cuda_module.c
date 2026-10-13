@@ -530,7 +530,15 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
         exec_stream->workspace    = NULL;
         PARSEC_OBJ_CONSTRUCT(&exec_stream->infos, parsec_info_object_array_t);
         parsec_info_object_array_init(&exec_stream->infos, &parsec_per_stream_infos, exec_stream);
+        /* Limit the traffic queued on the pushout stream (see parsec_gpu_d2h_max_events) */
         exec_stream->max_events   = PARSEC_MAX_EVENTS_PER_STREAM;
+        exec_stream->max_batch    = PARSEC_DEVICE_MAX_BATCH_SIZE;
+        if( 1 == j ) {
+            if( (parsec_gpu_d2h_max_events > 0) && (parsec_gpu_d2h_max_events < exec_stream->max_events) )
+                exec_stream->max_events = parsec_gpu_d2h_max_events;
+            if( (parsec_gpu_d2h_max_batch > 0) && (parsec_gpu_d2h_max_batch < exec_stream->max_batch) )
+                exec_stream->max_batch = parsec_gpu_d2h_max_batch;
+        }
         exec_stream->executed     = 0;
         exec_stream->start        = 0;
         exec_stream->end          = 0;

@@ -180,6 +180,8 @@ static const parsec_symbol_t symb_gpu_d2h_task_param = {
 
 int32_t parsec_gpu_d2h_max_flows = 0;
 int32_t parsec_gpu_d2h_max_discarded = 0;
+int32_t parsec_gpu_d2h_max_events = PARSEC_MAX_EVENTS_PER_STREAM;
+int32_t parsec_gpu_d2h_max_batch = PARSEC_DEVICE_MAX_BATCH_SIZE;
 
 static const parsec_task_class_t parsec_gpu_d2h_task_class = {
     .name = "GPU D2H data transfer",

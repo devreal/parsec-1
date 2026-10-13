@@ -24,6 +24,12 @@ BEGIN_C_DECLS
 #define PARSEC_MAX_EVENTS_PER_STREAM  4
 #define PARSEC_GPU_MAX_WORKSPACE      2
 
+/**
+ * Crutch: cap the max number of tasks that can be moved from one stage to the next.
+ * We should instead allow the user to express the max batch size in the task-class.
+ */
+#define PARSEC_DEVICE_MAX_BATCH_SIZE 64
+
 struct parsec_gpu_task_s;
 typedef struct parsec_gpu_task_s parsec_gpu_task_t;
 
@@ -295,6 +301,7 @@ struct parsec_gpu_exec_stream_s {
     struct parsec_gpu_task_s        **tasks;
     char                             *name;
     int32_t                           max_events;  /* number of potential events, and tasks */
+    int32_t                           max_batch;   /* max number of tasks submitted together */
     int32_t                           executed;    /* number of executed tasks */
     int32_t                           start;  /* circular buffer management start and end positions */
     int32_t                           end;
@@ -321,6 +328,12 @@ PARSEC_DECLSPEC extern int parsec_gpu_output_stream;
 PARSEC_DECLSPEC extern int parsec_gpu_verbosity;
 PARSEC_DECLSPEC extern int32_t parsec_gpu_d2h_max_flows;
 PARSEC_DECLSPEC extern int32_t parsec_gpu_d2h_max_discarded;
+/* Max number of events (task rings) in flight on the device-to-host (pushout) stream,
+ * and max number of tasks grouped into a single ring on that stream. Lowering them
+ * limits how much pushout traffic can be queued ahead of transfers submitted on the
+ * execution streams, which share the same copy engine. */
+PARSEC_DECLSPEC extern int32_t parsec_gpu_d2h_max_events;
+PARSEC_DECLSPEC extern int32_t parsec_gpu_d2h_max_batch;
 
 /**
  * Debugging functions.

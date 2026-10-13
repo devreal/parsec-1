@@ -272,6 +272,12 @@ static int device_level_zero_component_register(void)
     (void)parsec_mca_param_reg_int_name("device_level_zero", "max_number_of_discarded_data",
                                         "Sets up the maximum number of discarded blocks to be collected at once",
                                         false, false, MAX_PARAM_COUNT, &parsec_gpu_d2h_max_discarded);
+    (void)parsec_mca_param_reg_int_name("device_level_zero", "max_pushout_events",
+                                        "Maximum number of events in flight on the pushout (device-to-host) stream; lower values reduce the delay of transfers issued on the execution streams (values outside [1, default] are ignored)",
+                                        false, false, PARSEC_MAX_EVENTS_PER_STREAM, &parsec_gpu_d2h_max_events);
+    (void)parsec_mca_param_reg_int_name("device_level_zero", "max_pushout_batch",
+                                        "Maximum number of tasks whose data is pushed out together on the pushout (device-to-host) stream (values outside [1, default] are ignored)",
+                                        false, false, PARSEC_DEVICE_MAX_BATCH_SIZE, &parsec_gpu_d2h_max_batch);
     (void)parsec_mca_param_reg_int_name("device_level_zero", "max_streams",
                                         "Maximum number of Streams to use for the GPU engine; 2 streams are used for communication between host and device, so the minimum is 3",
                                         false, false, PARSEC_GPU_MAX_STREAMS, &parsec_level_zero_max_streams);

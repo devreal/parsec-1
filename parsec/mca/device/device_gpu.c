@@ -43,12 +43,6 @@ int parsec_gpu_verbosity;
 
 static thread_local int active_w2r_tasks = 0;
 
-/**
- * Crutch: cap the max number of tasks that can be moved from one stage to the next.
- * We should instead allow the user to express the max batch size in the task-class.
- */
-#define PARSEC_DEVICE_MAX_BATCH_SIZE 64
-
 
 /**
  * @brief Prepare a task for execution on the GPU. Basically, does some upstream initialization,
@@ -2487,7 +2481,7 @@ parsec_device_stream_grab_ring( parsec_device_gpu_module_t* gpu_device,
         return ring;
 
     for( item = (parsec_list_item_t*)fifo_pending->ghost_element.list_next;
-         (item != &fifo_pending->ghost_element) && (nb_tasks < PARSEC_DEVICE_MAX_BATCH_SIZE);
+         (item != &fifo_pending->ghost_element) && (nb_tasks < stream->max_batch);
          item = next ) {
         next = (parsec_list_item_t*)item->list_next;
         task = (parsec_gpu_task_t*)item;
