@@ -3608,10 +3608,6 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         /* If we can extract data go for it, otherwise try to drain the pending tasks */
         if (active_w2r_tasks == 0) {
             gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
-            if (PARSEC_GPU_W2R_DISCARDED == gpu_task) {
-                gpu_task = NULL;
-                goto check_in_deps;
-            }
             if( NULL != gpu_task ) {
                 active_w2r_tasks++;
                 goto get_data_out_of_device;

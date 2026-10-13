@@ -344,10 +344,6 @@ int parsec_device_push_workspace(parsec_device_gpu_module_t* gpu_device, parsec_
 void* parsec_device_pop_workspace(parsec_device_gpu_module_t* gpu_device, parsec_gpu_exec_stream_t* gpu_stream, size_t size);
 int parsec_device_free_workspace(parsec_device_gpu_module_t * gpu_device);
 
-/**
- * Return a special task indicating that data is discarded and no W2R task was needed.
- */
-#define PARSEC_GPU_W2R_DISCARDED (parsec_gpu_task_t*)0x0001
 parsec_gpu_task_t* parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_execution_stream_t *es);
 int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_gpu_task_t *w2r_task, parsec_execution_stream_t *es);
 
