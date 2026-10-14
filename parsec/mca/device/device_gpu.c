@@ -40,6 +40,7 @@ static int parsec_gpu_profiling_initiated = 0;
 #endif  /* defined(PROFILING) */
 int parsec_gpu_output_stream = -1;
 int parsec_gpu_verbosity;
+int32_t parsec_gpu_exec_delay_batch = 1;
 
 static thread_local int active_w2r_tasks = 0;
 
@@ -2499,6 +2500,56 @@ parsec_device_stream_grab_ring( parsec_device_gpu_module_t* gpu_device,
 }
 
 /**
+ * Returns true if the submission of the tasks pending on the execution stream
+ * @p stream should be delayed: the task at the front of the queue is batchable
+ * and the stream still has work in flight. The task could not start before that
+ * work completed anyway, and delaying its submission allows the submit function
+ * to batch it with the tasks arriving in the meantime.
+ */
+static inline bool
+parsec_device_stream_delay_batch( parsec_device_gpu_module_t* gpu_device,
+                                  parsec_gpu_exec_stream_t* stream )
+{
+    parsec_gpu_task_t *head;
+
+    if( !parsec_gpu_exec_delay_batch ||
+        (NULL == stream->tasks[stream->end]) ||
+        parsec_list_nolock_is_empty(stream->fifo_pending) ||
+        !parsec_mca_device_type_supports_batch(gpu_device->super.type) )
+        return false;
+    head = (parsec_gpu_task_t*)stream->fifo_pending->ghost_element.list_next;
+    return parsec_gpu_task_selected_chore_allows_batch(head->ec, (parsec_device_module_t*)gpu_device);
+}
+
+/**
+ * If the execution stream @p stream is idle and has no pending tasks, take over
+ * a batchable task delayed on another execution stream, so that it does not wait
+ * for that stream to drain. Once submitted, the task can collect the other
+ * delayed tasks into its batch (see parsec_gpu_task_collect_batch()).
+ */
+static void
+parsec_device_stream_take_delayed( parsec_device_gpu_module_t* gpu_device,
+                                   parsec_gpu_exec_stream_t* stream )
+{
+    parsec_gpu_exec_stream_t *other;
+    parsec_list_item_t *item;
+
+    if( !parsec_gpu_exec_delay_batch ||
+        (NULL != stream->tasks[stream->end]) ||
+        !parsec_list_nolock_is_empty(stream->fifo_pending) )
+        return;
+    for( int i = 2; i < gpu_device->num_exec_streams; i++ ) {
+        other = gpu_device->exec_stream[i];
+        if( (other == stream) || !parsec_device_stream_delay_batch(gpu_device, other) )
+            continue;
+        item = parsec_list_nolock_pop_front(other->fifo_pending);
+        PARSEC_LIST_ITEM_SINGLETON(item);
+        parsec_list_nolock_push_back(stream->fifo_pending, item);
+        return;
+    }
+}
+
+/**
  * Release the tasks in @p ring that have been withdrawn from the device by a
  * data movement stage while other tasks are still managed by the device (so
  * that this thread remains the manager of the device).
@@ -2647,7 +2698,10 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
                 assert(batch);
                 parsec_list_nolock_chain_front(stream->fifo_pending, &again_ring->list_item);
             }
-            goto complete;
+            /* Execution streams delaying batchable tasks submit them as soon as the
+             * stream drained, instead of waiting for the next visit of the stream. */
+            if( batch || !parsec_gpu_exec_delay_batch || (NULL != error_task) )
+                goto complete;
         }
     }
 
@@ -2660,6 +2714,8 @@ parsec_device_progress_stream( parsec_device_gpu_module_t* gpu_device,
     while( (NULL == stream->tasks[stream->start]) &&
            (NULL == next_ring) && (NULL == error_task) ) {
         if( NULL == ring ) {
+            if( !batch && parsec_device_stream_delay_batch(gpu_device, stream) )
+                break;
             ring = parsec_device_stream_grab_ring(gpu_device, stream, batch);
         }
         if( NULL == ring ) {  /* No tasks, we're done */
@@ -3629,6 +3685,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,  "GPU[%d:%s]:\tExecute %s", gpu_device->super.device_index, gpu_device->super.name,
                              parsec_task_snprintf(tmp, MAX_TASK_STRLEN, gpu_task->ec));
     }
+    parsec_device_stream_take_delayed(gpu_device, gpu_device->exec_stream[2+exec_stream]);
     rc = parsec_device_progress_stream( gpu_device,
                                         gpu_device->exec_stream[2+exec_stream],
                                         parsec_device_kernel_exec,

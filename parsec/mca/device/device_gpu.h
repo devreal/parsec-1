@@ -334,6 +334,9 @@ PARSEC_DECLSPEC extern int32_t parsec_gpu_d2h_max_discarded;
  * execution streams, which share the same copy engine. */
 PARSEC_DECLSPEC extern int32_t parsec_gpu_d2h_max_events;
 PARSEC_DECLSPEC extern int32_t parsec_gpu_d2h_max_batch;
+/* Delay the submission of batchable tasks on an execution stream until the work
+ * in flight on that stream completed, so they can be batched with later tasks. */
+PARSEC_DECLSPEC extern int32_t parsec_gpu_exec_delay_batch;
 
 /**
  * Debugging functions.
