@@ -368,6 +368,11 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device,
             PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
                                  "D2H[%d:%s] task %p:%i GPU data copy %p [%p] now available",
                                  gpu_device->super.device_index, gpu_device->super.name, (void*)task, i, gpu_copy, gpu_copy->original);
+            /* A task may have used the copy while it was evicted and put it back into
+             * an LRU (see parsec_device_kernel_epilog), so take it out of whatever list
+             * it is in: it was made a singleton when the eviction started. */
+            parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
+            PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
             parsec_list_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
         }
 

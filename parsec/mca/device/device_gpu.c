@@ -753,24 +753,27 @@ static int parsec_device_memory_release_discarded(parsec_device_gpu_module_t* gp
         return 0;
     }
 
+    /* Items are unlinked while iterating, so remember the successor before an
+     * item is removed and released. An item must be removed from the list before
+     * it is made a singleton (which resets its own links, not its neighbors') and
+     * before it is released (which may free it). */
     for (item = PARSEC_LIST_ITERATOR_BEGIN(list);
-         item != PARSEC_LIST_ITERATOR_END(list);
-         item = PARSEC_LIST_ITEM_NEXT(item)) {
+         item != PARSEC_LIST_ITERATOR_END(list); ) {
+        parsec_list_item_t* next = (parsec_list_item_t*)PARSEC_LIST_ITEM_NEXT(item);
         parsec_gpu_data_copy_t* gpu_copy = (parsec_gpu_data_copy_t*)item;
         parsec_data_t* original = gpu_copy->original;
         if (NULL != original) {
             parsec_data_copy_t *cpu_copy = original->device_copies[0];
-            PARSEC_LIST_ITEM_SINGLETON(item);
-
-            if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED && cpu_copy->readers == 0) {
+            if (NULL != cpu_copy && (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) && cpu_copy->readers == 0) {
                 count++;
                 PARSEC_DEBUG_VERBOSE(30, parsec_gpu_output_stream,
                                     "Releasing discarded GPU copy %p from data %p", gpu_copy, original);
-                parsec_device_release_gpu_copy(gpu_device, gpu_copy);
                 parsec_list_nolock_remove(list, item);
-                continue;
+                PARSEC_LIST_ITEM_SINGLETON(item);
+                parsec_device_release_gpu_copy(gpu_device, gpu_copy);
             }
         }
+        item = next;
     }
     parsec_atomic_fetch_sub_int64(&gpu_device->super.nb_discarded, count);
     return count;
