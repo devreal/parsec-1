@@ -306,6 +306,7 @@ struct parsec_gpu_exec_stream_s {
     int32_t                           start;  /* circular buffer management start and end positions */
     int32_t                           end;
     parsec_list_t                    *fifo_pending;
+    parsec_list_t                    *fifo_batch;  /* batchable tasks pending on execution streams */
     parsec_gpu_workspace_t           *workspace;
     parsec_info_object_array_t        infos; /**< Per-stream info objects are stored here */
 

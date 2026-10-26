@@ -545,6 +545,7 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
         exec_stream->name         = NULL;
         exec_stream->fifo_pending = (parsec_list_t*)PARSEC_OBJ_NEW(parsec_list_t);
         PARSEC_OBJ_CONSTRUCT(exec_stream->fifo_pending, parsec_list_t);
+        exec_stream->fifo_batch   = PARSEC_OBJ_NEW(parsec_list_t);
         exec_stream->tasks    = (parsec_gpu_task_t**)malloc(exec_stream->max_events
                                                             * sizeof(parsec_gpu_task_t*));
         cuda_stream->events   = (cudaEvent_t*)malloc(exec_stream->max_events * sizeof(cudaEvent_t));
@@ -689,6 +690,9 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
             if( NULL != exec_stream->fifo_pending ) {
                 PARSEC_OBJ_RELEASE(exec_stream->fifo_pending);
             }
+            if( NULL != exec_stream->fifo_batch ) {
+                PARSEC_OBJ_RELEASE(exec_stream->fifo_batch);
+            }
             if( NULL != exec_stream->tasks ) {
                 free(exec_stream->tasks); exec_stream->tasks = NULL;
             }
@@ -759,6 +763,9 @@ parsec_cuda_module_fini(parsec_device_module_t* device)
         free(cuda_stream->events); cuda_stream->events = NULL;
         free(exec_stream->tasks); exec_stream->tasks = NULL;
         free(exec_stream->fifo_pending); exec_stream->fifo_pending = NULL;
+        if( NULL != exec_stream->fifo_batch ) {
+            PARSEC_OBJ_RELEASE(exec_stream->fifo_batch);
+        }
         /* Release the stream */
         cudaStreamDestroy( cuda_stream->cuda_stream );
         free(exec_stream->name);
