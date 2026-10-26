@@ -2556,10 +2556,11 @@ parsec_device_stream_delay_batch( parsec_gpu_exec_stream_t* stream )
 
 /**
  * Extract the next task to submit from the pending queues of the execution
- * stream @p stream. Non-batchable tasks can always be submitted, batchable tasks
- * only if they are not delayed (see parsec_device_stream_delay_batch()). If both
- * kinds are eligible, the task with the highest priority is selected, and the
- * oldest one in case of a tie.
+ * stream @p stream. The task with the highest priority (the oldest one in case
+ * of a tie) at the front of the two queues is selected. If it is batchable and
+ * batchable tasks are delayed (see parsec_device_stream_delay_batch()), nothing
+ * is submitted: the non-batchable tasks with a lower priority wait as well, so
+ * that they don't keep the stream busy and delay the batch further.
  */
 static inline parsec_gpu_task_t*
 parsec_device_exec_stream_grab( parsec_gpu_exec_stream_t* stream )
@@ -2570,12 +2571,14 @@ parsec_device_exec_stream_grab( parsec_gpu_exec_stream_t* stream )
 
     if( !parsec_list_nolock_is_empty(stream->fifo_pending) )
         task = (parsec_gpu_task_t*)stream->fifo_pending->ghost_element.list_next;
-    if( !parsec_list_nolock_is_empty(stream->fifo_batch) && !parsec_device_stream_delay_batch(stream) )
+    if( !parsec_list_nolock_is_empty(stream->fifo_batch) )
         batch_task = (parsec_gpu_task_t*)stream->fifo_batch->ghost_element.list_next;
     if( (NULL != batch_task) &&
         ((NULL == task) ||
          (batch_task->priority > task->priority) ||
          ((batch_task->priority == task->priority) && (batch_task->heap_seq < task->heap_seq))) ) {
+        if( parsec_device_stream_delay_batch(stream) )
+            return NULL;
         queue = stream->fifo_batch;
     } else if( NULL == task ) {
         return NULL;
