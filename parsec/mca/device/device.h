@@ -195,6 +195,12 @@ extern int parsec_device_output;
 extern int parsec_device_skip_empty_events;
 
 /**
+ * Whether to capture a second thread that submits the kernels of a GPU device
+ * while another thread manages its data movements (disabled by default).
+ */
+extern int parsec_device_exec_thread;
+
+/**
  * @brief Find the best device to execute the kernel based on the compute
  * capability of the device.
  *

@@ -575,8 +575,13 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
         gpu_device->trackable_events = PARSEC_PROFILE_GPU_TRACK_EXEC | PARSEC_PROFILE_GPU_TRACK_DATA_OUT
                                     | PARSEC_PROFILE_GPU_TRACK_DATA_IN | PARSEC_PROFILE_GPU_TRACK_OWN | PARSEC_PROFILE_GPU_TRACK_MEM_USE
                                     | PARSEC_PROFILE_GPU_TRACK_PREFETCH;
-        if(j == 0 || (parsec_device_cuda_one_profiling_stream_per_gpu_stream == 1 && j != 1))
+        /* Profiling streams are not thread-safe: with an executor thread, the execution
+         * streams cannot share the profiling stream of the transfer streams. */
+        if(j == 0 || (parsec_device_cuda_one_profiling_stream_per_gpu_stream == 1 && j != 1) ||
+           (j == 2 && parsec_device_exec_thread))
             exec_stream->profiling = parsec_profiling_stream_init( 2*1024*1024, PARSEC_PROFILE_STREAM_STR, dev_id, j );
+        else if(j > 2 && parsec_device_exec_thread)
+            exec_stream->profiling = gpu_device->exec_stream[2]->profiling;
         else
             exec_stream->profiling = gpu_device->exec_stream[0]->profiling;
         if(j == 0) {
@@ -630,6 +635,8 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
     parsec_heap_init(&gpu_device->pending_heap, offsetof(parsec_gpu_task_t, priority),
                      offsetof(parsec_gpu_task_t, heap_seq));
     PARSEC_OBJ_CONSTRUCT(&gpu_device->gpu_mem_inbox, parsec_lifo_t);
+    PARSEC_OBJ_CONSTRUCT(&gpu_device->exec_inbox, parsec_lifo_t);
+    PARSEC_OBJ_CONSTRUCT(&gpu_device->exec_outbox, parsec_lifo_t);
 
     gpu_device->peer_access_mask = 0;  /* No GPU to GPU direct transfer by default */
 
@@ -740,9 +747,13 @@ parsec_cuda_module_fini(parsec_device_module_t* device)
     /* Release the registered memory */
     parsec_device_memory_release(gpu_device);
 
+    parsec_device_dump_stage_times(gpu_device);
+
     /* Release pending queue and heap */
     PARSEC_OBJ_DESTRUCT(&gpu_device->pending);
     parsec_heap_fini(&gpu_device->pending_heap);
+    PARSEC_OBJ_DESTRUCT(&gpu_device->exec_inbox);
+    PARSEC_OBJ_DESTRUCT(&gpu_device->exec_outbox);
 
     /* Release all streams */
     for( j = 0; j < gpu_device->num_exec_streams; j++ ) {

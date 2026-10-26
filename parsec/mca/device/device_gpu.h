@@ -258,6 +258,22 @@ typedef int (*parsec_device_memory_free_fn_t)(struct parsec_device_gpu_module_s 
  */
 typedef void* (*parsec_device_find_incarnation_fn_t)(parsec_device_gpu_module_t* gpu_device, const char* fname);
 
+/**
+ * Stages of the device management, used to account for the time the threads
+ * managing the device spend in each of them (see parsec_device_kernel_scheduler()).
+ */
+typedef enum parsec_device_stage_e {
+    PARSEC_DEVICE_STAGE_INTAKE = 0,  /**< moving new tasks from the pending queue into the heap */
+    PARSEC_DEVICE_STAGE_IN,          /**< progressing the host-to-device stream */
+    PARSEC_DEVICE_STAGE_EVICT,       /**< releasing discarded data and creating eviction tasks */
+    PARSEC_DEVICE_STAGE_EXEC,        /**< progressing the execution streams (or handing tasks over) */
+    PARSEC_DEVICE_STAGE_OUT,         /**< progressing the device-to-host stream */
+    PARSEC_DEVICE_STAGE_COMPLETE,    /**< completing tasks */
+    PARSEC_DEVICE_STAGE_MANAGED,     /**< total time a thread managed the device */
+    PARSEC_DEVICE_STAGE_EXECUTOR,    /**< progressing the execution streams on the executor thread */
+    PARSEC_DEVICE_NB_STAGES
+} parsec_device_stage_t;
+
 struct parsec_device_gpu_module_s {
     parsec_device_module_t     super;
 
@@ -288,6 +304,17 @@ struct parsec_device_gpu_module_s {
     parsec_lifo_t              pending;       /**< lock-free LIFO: CPU threads push here */
     parsec_binheap_t           pending_heap;  /**< manager-private max-heap for priority ordering */
     parsec_lifo_t              gpu_mem_inbox; /**< lock-free LIFO: other manager threads push here */
+    /* Executor thread: a second thread that owns the execution streams while it is active
+     * (see parsec_device_executor_loop()) */
+    volatile int32_t           exec_owner;    /**< 0: the manager owns the execution streams,
+                                               *   1: the executor thread owns them,
+                                               *   2: the executor thread waits for the manager to hand them over */
+    volatile int32_t           exec_error;    /**< set by the executor thread if the device must be disabled */
+    volatile int32_t           nb_exec_tasks; /**< tasks handed to the executor thread and not returned yet */
+    parsec_lifo_t              exec_inbox;    /**< lock-free LIFO: stage-in completed tasks, manager -> executor */
+    parsec_lifo_t              exec_outbox;   /**< lock-free LIFO: executed tasks, executor -> manager */
+    uint64_t                   stage_time_ns[PARSEC_DEVICE_NB_STAGES]; /**< time spent in each stage */
+    uint64_t                   stage_calls[PARSEC_DEVICE_NB_STAGES];   /**< number of times each stage was progressed */
     struct zone_malloc_s      *memory;
     parsec_gpu_exec_stream_t **exec_stream;
     size_t                     mem_block_size;
@@ -344,6 +371,8 @@ PARSEC_DECLSPEC extern int32_t parsec_gpu_exec_delay_batch;
  */
 void parsec_device_dump_exec_stream(parsec_gpu_exec_stream_t* exec_stream);
 void parsec_device_dump_gpu_state(parsec_device_gpu_module_t* gpu_device);
+/* Print the time spent in each stage of the device management, if device_show_statistics is set */
+void parsec_device_dump_stage_times(parsec_device_gpu_module_t* gpu_device);
 
 /****************************************************
  ** GPU-DATA Specific Starts Here **

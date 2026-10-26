@@ -14,6 +14,7 @@
 #include "parsec/utils/debug.h"
 #include "parsec/execution_stream.h"
 #include "parsec/utils/argv.h"
+#include "parsec/utils/mca_param.h"
 #include "parsec/parsec_internal.h"
 #include "parsec/scheduling.h"
 
@@ -44,6 +45,22 @@ int32_t parsec_gpu_exec_delay_batch = 1;
 
 static thread_local int active_w2r_tasks = 0;
 
+static inline uint64_t
+parsec_device_time_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Account the time elapsed since @p t0 to @p stage of @p gpu_device, and restart @p t0 */
+#define PARSEC_DEVICE_STAGE_TIME(gpu_device, stage, t0)            \
+    do {                                                           \
+        uint64_t _t1 = parsec_device_time_ns();                    \
+        (gpu_device)->stage_time_ns[(stage)] += _t1 - (t0);        \
+        (gpu_device)->stage_calls[(stage)]++;                      \
+        (t0) = _t1;                                                \
+    } while(0)
 
 /**
  * @brief Prepare a task for execution on the GPU. Basically, does some upstream initialization,
@@ -332,6 +349,26 @@ void parsec_device_dump_gpu_state(parsec_device_gpu_module_t* gpu_device)
     parsec_output(parsec_gpu_output_stream, "\n\n");
 }
 
+void parsec_device_dump_stage_times(parsec_device_gpu_module_t* gpu_device)
+{
+    static const char *stage_names[PARSEC_DEVICE_NB_STAGES] = {
+        "intake", "stage-in", "evict", "exec", "stage-out", "complete", "managed", "executor" };
+    int show_stats_index, show_stats = 0;
+
+    show_stats_index = parsec_mca_param_find("device", NULL, "show_statistics");
+    if( 0 < show_stats_index )
+        parsec_mca_param_lookup_int(show_stats_index, &show_stats);
+    if( !show_stats || (0 == gpu_device->stage_calls[PARSEC_DEVICE_STAGE_MANAGED]) )
+        return;
+
+    printf("Device %d (%s) management time per stage:\n", gpu_device->super.device_index, gpu_device->super.name);
+    for( int i = 0; i < PARSEC_DEVICE_NB_STAGES; i++ ) {
+        uint64_t calls = gpu_device->stage_calls[i];
+        printf("  %-10s %12.3f ms  %12"PRIu64" calls  %10.3f us/call\n", stage_names[i],
+               (double)gpu_device->stage_time_ns[i] / 1e6, calls,
+               (0 == calls) ? 0.0 : ((double)gpu_device->stage_time_ns[i] / 1e3) / (double)calls);
+    }
+}
 
 static parsec_flow_t parsec_device_data_prefetch_flow = {
     .name = "PREFETCH FLOW",
@@ -3606,6 +3643,200 @@ parsec_gpu_pending_chain_reverse(parsec_list_item_t *chain)
 }
 
 /**
+ * Executor thread
+ *
+ * While a thread manages the device (see parsec_device_kernel_scheduler()), a
+ * second thread can be captured to submit the kernels: the executor thread owns
+ * the execution streams, so that the submission of the kernels is not delayed by
+ * the management of the data (stage-in, stage-out, evictions). The memory and the
+ * data coherency are only managed by the manager thread, the two threads exchange
+ * tasks through lock-free queues:
+ *   - exec_inbox: tasks that completed the stage-in, manager -> executor
+ *   - exec_outbox: tasks that left the execution streams, executor -> manager, with
+ *     their outcome in last_status: PARSEC_HOOK_RETURN_DONE (move on to the stage-out),
+ *     PARSEC_HOOK_RETURN_ASYNC (withdrawn from the device) or PARSEC_HOOK_RETURN_NEXT
+ *     (to be rescheduled on another device).
+ * The ownership of the execution streams is tracked by exec_owner (see
+ * parsec_device_gpu_module_t). The executor requests them by setting exec_owner from
+ * 0 to 2, and the manager hands them over at the beginning of its next loop by setting
+ * it to 1. The executor gives them back by setting it to 0 once the device is idle,
+ * the manager then submits the kernels of the tasks remaining in exec_inbox itself.
+ * The executor leaves together with the manager, when no task is left on the device.
+ */
+
+/* Move the tasks of the ring @p ring into the queue @p queue, accounting for them in
+ * the number of tasks owned by the executor thread with @p sign. */
+static void
+parsec_device_executor_push( parsec_device_gpu_module_t *gpu_device,
+                             parsec_lifo_t *queue,
+                             parsec_gpu_task_t *ring,
+                             int sign )
+{
+    parsec_gpu_task_t *next;
+    int cnt = 0;
+
+    do {
+        next = (parsec_gpu_task_t*)parsec_list_item_ring_chop(&ring->list_item);
+        PARSEC_LIST_ITEM_SINGLETON(&ring->list_item);
+        parsec_lifo_push(queue, &ring->list_item);
+        cnt++;
+        ring = next;
+    } while( NULL != ring );
+    (void)parsec_atomic_fetch_add_int32(&gpu_device->nb_exec_tasks, sign * cnt);
+}
+
+/* Set the outcome @p rc of all tasks of @p ring, and hand them back to the manager */
+static void
+parsec_device_executor_return( parsec_device_gpu_module_t *gpu_device,
+                               parsec_gpu_task_t *ring,
+                               int rc )
+{
+    parsec_gpu_task_t *iter = ring;
+
+    do {
+        iter->last_status = rc;
+        iter = (parsec_gpu_task_t*)iter->list_item.list_next;
+    } while( iter != ring );
+    parsec_device_executor_push(gpu_device, &gpu_device->exec_outbox, ring, -1);
+}
+
+/* Distribute the tasks of the chain @p chain (detached from a LIFO) on the execution
+ * streams, in arrival order, starting with the stream after @p *next_stream.
+ * Returns the number of tasks. */
+static int
+parsec_device_exec_streams_push_chain( parsec_device_gpu_module_t *gpu_device,
+                                       parsec_list_item_t *chain,
+                                       int *next_stream )
+{
+    int nb_streams = gpu_device->num_exec_streams - 2, cnt = 0;
+    parsec_list_item_t *item;
+
+    chain = parsec_gpu_pending_chain_reverse(chain);
+    while( NULL != chain ) {
+        item = chain;
+        chain = (parsec_list_item_t*)chain->list_next;
+        PARSEC_LIST_ITEM_SINGLETON(item);
+        *next_stream = (*next_stream + 1) % nb_streams;
+        parsec_gpu_stream_push_pending(gpu_device, gpu_device->exec_stream[2 + *next_stream],
+                                       (parsec_gpu_task_t*)item);
+        cnt++;
+    }
+    return cnt;
+}
+
+/**
+ * Hand the tasks returned by the executor thread over to the stage-out, or reschedule
+ * them. Returns the ring of tasks that must leave the device (see remove_gpu_task in
+ * parsec_device_kernel_scheduler()), or NULL.
+ */
+static parsec_gpu_task_t*
+parsec_device_executor_collect( parsec_device_gpu_module_t *gpu_device,
+                                parsec_execution_stream_t *es )
+{
+    parsec_list_item_t *chain, *item;
+    parsec_gpu_task_t *task, *release_ring = NULL;
+
+    chain = parsec_lifo_detach_chain(&gpu_device->exec_outbox);
+    if( NULL == chain )
+        return NULL;
+    chain = parsec_gpu_pending_chain_reverse(chain);
+    while( NULL != chain ) {
+        item = chain;
+        chain = (parsec_list_item_t*)chain->list_next;
+        PARSEC_LIST_ITEM_SINGLETON(item);
+        task = (parsec_gpu_task_t*)item;
+        if( PARSEC_HOOK_RETURN_DONE == task->last_status ) {
+            parsec_gpu_stream_push_pending(gpu_device, gpu_device->exec_stream[1], task);
+            continue;
+        }
+        if( PARSEC_HOOK_RETURN_NEXT == task->last_status ) {
+            /* Reschedule the task. As the chore_id has been modified,
+             * another incarnation of the task will be executed. */
+            parsec_device_kernel_cleanout(gpu_device, task);
+            __parsec_reschedule(es, task->ec);
+        }
+        parsec_gpu_task_ring_append(&release_ring, task);
+    }
+    return release_ring;
+}
+
+/**
+ * Submit the kernels of the device while the manager thread handles everything else,
+ * until the device has no more tasks (see the description of the executor thread above).
+ * The calling thread must have changed exec_owner from 0 to 2.
+ */
+static void
+parsec_device_executor_loop( parsec_device_gpu_module_t *gpu_device,
+                             parsec_execution_stream_t *es )
+{
+    int i, rc, next_stream = 0, nb_streams = gpu_device->num_exec_streams - 2;
+    parsec_gpu_task_t *progress_task;
+    parsec_list_item_t *chain;
+    parsec_gpu_exec_stream_t *stream;
+    uint64_t t0;
+    bool idle;
+    (void)es;
+
+    /* Wait for the manager to hand the execution streams over, unless it left meanwhile */
+    while( 1 != gpu_device->exec_owner ) {
+        if( ((gpu_device->mutex <= 0) || gpu_device->exec_error) &&
+            parsec_atomic_cas_int32(&gpu_device->exec_owner, 2, 0) )
+            return;
+    }
+    parsec_atomic_rmb();
+    PARSEC_DEBUG_VERBOSE(5, parsec_gpu_output_stream, "GPU[%d:%s]: Entering kernel submission",
+                         gpu_device->super.device_index, gpu_device->super.name);
+
+    if( PARSEC_SUCCESS != gpu_device->set_device(gpu_device) ) {
+        /* Keep the execution streams, the manager will disable the device */
+        gpu_device->exec_error = 1;
+        return;
+    }
+
+    while( 1 ) {
+        if( gpu_device->exec_error )  /* the device is being disabled */
+            return;
+        t0 = parsec_device_time_ns();
+        chain = parsec_lifo_detach_chain(&gpu_device->exec_inbox);
+        if( NULL != chain ) {
+            parsec_device_exec_streams_push_chain(gpu_device, chain, &next_stream);
+        }
+
+        idle = true;
+        for( i = 0; i < nb_streams; i++ ) {
+            stream = gpu_device->exec_stream[2 + i];
+            parsec_device_stream_take_delayed(gpu_device, stream);
+            rc = parsec_device_progress_stream( gpu_device, stream,
+                                                parsec_device_kernel_exec,
+                                                NULL, &progress_task, false );
+            if( (PARSEC_HOOK_RETURN_DISABLE == rc) || (PARSEC_HOOK_RETURN_ERROR == rc) ) {
+                /* Keep the execution streams, the manager will disable the device */
+                gpu_device->exec_error = 1;
+                return;
+            }
+            if( NULL != progress_task ) {
+                /* Withdrawn tasks leave the device, any other error reschedules the task */
+                parsec_device_executor_return(gpu_device, progress_task,
+                                              (rc >= 0) ? PARSEC_HOOK_RETURN_DONE :
+                                              (PARSEC_HOOK_RETURN_ASYNC == rc) ? PARSEC_HOOK_RETURN_ASYNC :
+                                                                                PARSEC_HOOK_RETURN_NEXT);
+            }
+            idle = idle && !parsec_device_stream_has_tasks(stream);
+        }
+        PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_EXECUTOR, t0);
+
+        /* All tasks handed to the executor are accounted for in the device mutex until
+         * the manager completes them: once it drops to 0 the device is idle. */
+        if( idle && (gpu_device->mutex <= 0) && parsec_lifo_is_empty(&gpu_device->exec_inbox) &&
+            parsec_atomic_cas_int32(&gpu_device->exec_owner, 1, 0) ) {
+            break;
+        }
+    }
+    PARSEC_DEBUG_VERBOSE(5, parsec_gpu_output_stream, "GPU[%d:%s]: Leaving kernel submission",
+                         gpu_device->super.device_index, gpu_device->super.name);
+}
+
+/**
  * This version is based on 4 streams: one for transfers from the memory to
  * the GPU, 2 for kernel executions and one for transfers from the GPU into
  * the main memory. The synchronization on each stream is based on GPU events,
@@ -3631,6 +3862,8 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     char tmp[MAX_TASK_STRLEN];
 #endif
     int pop_null = 0;
+    bool exec_offload = false;  /* the kernels are submitted by the executor thread */
+    uint64_t t0, t_managed;
 
 #if defined(PARSEC_PROF_TRACE)
     PARSEC_PROFILING_TRACE_FLAGS( es->es_profile,
@@ -3670,6 +3903,11 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     }
     if( 0 < rc ) {
         parsec_lifo_push( &(gpu_device->pending), (parsec_list_item_t*)gpu_task );
+        /* Become the executor thread of the device if there is none yet */
+        if( parsec_device_exec_thread && (0 == gpu_device->exec_owner) &&
+            parsec_atomic_cas_int32(&gpu_device->exec_owner, 0, 2) ) {
+            parsec_device_executor_loop(gpu_device, es);
+        }
         return PARSEC_HOOK_RETURN_ASYNC;
     }
     PARSEC_DEBUG_VERBOSE(5, parsec_gpu_output_stream, "GPU[%d:%s]: Entering GPU management",
@@ -3684,8 +3922,20 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     rc = gpu_device->set_device(gpu_device);
     if(PARSEC_SUCCESS != rc)
         return PARSEC_HOOK_RETURN_DISABLE;
+    t_managed = parsec_device_time_ns();
 
  check_in_deps:
+
+    /* Hand the execution streams over to the executor thread if it requested them, and
+     * keep their owner for this round. */
+    if( parsec_device_exec_thread ) {
+        if( 2 == gpu_device->exec_owner )
+            (void)parsec_atomic_cas_int32(&gpu_device->exec_owner, 2, 1);
+        exec_offload = (1 == gpu_device->exec_owner);
+        parsec_atomic_rmb();
+        if( gpu_device->exec_error )
+            goto disable_gpu;
+    }
 
     /**
      * Drain the gpu_mem_inbox to reclaim lru elements.
@@ -3708,10 +3958,12 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                              gpu_device->super.device_index, gpu_device->super.name,
                              parsec_device_describe_gpu_task(tmp, MAX_TASK_STRLEN, gpu_task));
     }
+    t0 = parsec_device_time_ns();
     rc = parsec_device_progress_stream( gpu_device,
                                         gpu_device->exec_stream[0],
                                         parsec_device_kernel_push,
                                         gpu_task, &progress_task, true );
+    PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_IN, t0);
     if( rc < 0 ) {  /* In case of error progress_task is the task that raised it */
         if( PARSEC_HOOK_RETURN_ERROR == rc )
             goto disable_gpu;
@@ -3728,6 +3980,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
 
         /* try to release all discarded copies and try again if succesful */
         if (0 < parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_owned_lru)) {
+            PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_EVICT, t0);
             gpu_task = NULL;
             goto check_in_deps;
         }
@@ -3735,17 +3988,44 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         /* If we can extract data go for it, otherwise try to drain the pending tasks.
          * Executing tasks release memory once they complete, so delay the eviction
          * while the next execution stream still has work, and start pushing data out
-         * as soon as it runs dry. */
+         * as soon as it runs dry. The execution streams of the executor thread can't
+         * be inspected, delay the eviction while it has any task. */
         if ((active_w2r_tasks == 0) &&
-            !parsec_device_stream_has_tasks(gpu_device->exec_stream[2 + (exec_stream + 1) % (gpu_device->num_exec_streams - 2)])) {
+            (exec_offload ? (0 == gpu_device->nb_exec_tasks) :
+             !parsec_device_stream_has_tasks(gpu_device->exec_stream[2 + (exec_stream + 1) % (gpu_device->num_exec_streams - 2)]))) {
             gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
             if( NULL != gpu_task ) {
+                PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_EVICT, t0);
                 active_w2r_tasks++;
                 goto get_data_out_of_device;
             }
         }
+        PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_EVICT, t0);
     }
     gpu_task = progress_task;
+
+    if( exec_offload ) {
+        /* Stage-in completed for these tasks: hand them over to the executor thread,
+         * and move the tasks it executed to the stage-out */
+        progress_task = NULL;
+        if( NULL != gpu_task ) {
+            PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,  "GPU[%d:%s]:\tHand over %s to the executor",
+                                 gpu_device->super.device_index, gpu_device->super.name,
+                                 parsec_task_snprintf(tmp, MAX_TASK_STRLEN, gpu_task->ec));
+            parsec_device_executor_push(gpu_device, &gpu_device->exec_inbox, gpu_task, 1);
+        }
+        gpu_task = parsec_device_executor_collect(gpu_device, es);
+        PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_EXEC, t0);
+        if( NULL != gpu_task )
+            goto remove_gpu_task;
+        goto get_data_out_of_device;
+    }
+    if( !parsec_lifo_is_empty(&gpu_device->exec_inbox) ) {
+        /* The executor thread left: submit the tasks it did not take */
+        cnt = parsec_device_exec_streams_push_chain(gpu_device, parsec_lifo_detach_chain(&gpu_device->exec_inbox),
+                                                    &exec_stream);
+        (void)parsec_atomic_fetch_sub_int32(&gpu_device->nb_exec_tasks, cnt);
+    }
 
     /* Stage-in completed for this task: it is ready to be executed */
     exec_stream = (exec_stream + 1) % (gpu_device->num_exec_streams - 2);  /* Choose an exec_stream */
@@ -3758,6 +4038,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                                         gpu_device->exec_stream[2+exec_stream],
                                         parsec_device_kernel_exec,
                                         gpu_task, &progress_task, false );
+    PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_EXEC, t0);
     if( rc < 0 ) {
         if( (PARSEC_HOOK_RETURN_DISABLE == rc) || (PARSEC_HOOK_RETURN_ERROR == rc) )
             goto disable_gpu;
@@ -3792,10 +4073,12 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         clear_device_counter = PARSEC_DEVICE_CLEAR_EVERY;
     }
     /* Task is ready to move the data back to main memory */
+    t0 = parsec_device_time_ns();
     rc = parsec_device_progress_stream( gpu_device,
                                         gpu_device->exec_stream[1],
                                         parsec_device_kernel_pop,
                                         gpu_task, &progress_task, true );
+    PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_OUT, t0);
     if( rc < 0 ) {
         if( (PARSEC_HOOK_RETURN_ERROR == rc) || (PARSEC_HOOK_RETURN_DISABLE == rc) )
             goto disable_gpu;
@@ -3813,6 +4096,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
 
  fetch_task_from_shared_queue:
     assert( NULL == gpu_task );
+    t0 = parsec_device_time_ns();
     {
         parsec_list_item_t *chain = parsec_lifo_detach_chain(&gpu_device->pending);
         if (NULL != chain) {
@@ -3828,6 +4112,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,  "GPU[%d:%s]:\tGet from shared queue %s", gpu_device->super.device_index, gpu_device->super.name,
                              parsec_device_describe_gpu_task(tmp, MAX_TASK_STRLEN, gpu_task));
         if( PARSEC_GPU_TASK_TYPE_D2D_COMPLETE == gpu_task->task_type ) {
+            PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_INTAKE, t0);
             goto get_data_out_of_device;
         }
         int chain_len = 1;
@@ -3852,10 +4137,12 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                                  gpu_device->super.device_index, gpu_device->super.name, gpu_device->mutex, pop_null);
         }
     }
+    PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_INTAKE, t0);
     goto check_in_deps;
 
  complete_task:
     assert( NULL != gpu_task );
+    t0 = parsec_device_time_ns();
     task_ring = NULL;
     release_ring = NULL;
     iter = gpu_task;
@@ -3903,6 +4190,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     task_ring = NULL;
     gpu_task = release_ring;
     release_ring = NULL;
+    PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_COMPLETE, t0);
  remove_gpu_task:
     if (gpu_task == NULL) {
         goto fetch_task_from_shared_queue;
@@ -3925,6 +4213,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     rc = parsec_atomic_fetch_sub_int32( &(gpu_device->mutex), cnt ) - cnt;
 
     if( 0 == rc ) {  /* I was the last one */
+        PARSEC_DEVICE_STAGE_TIME(gpu_device, PARSEC_DEVICE_STAGE_MANAGED, t_managed);
 #if defined(PARSEC_PROF_TRACE)
         if( gpu_device->trackable_events & PARSEC_PROFILE_GPU_TRACK_OWN )
             PARSEC_PROFILING_TRACE( es->es_profile, parsec_gpu_own_GPU_key_end,
@@ -3944,5 +4233,6 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
      */
     parsec_warning("GPU[%d:%s]: Critical issue related to the GPU discovered. Giving up",
                    gpu_device->super.device_index, gpu_device->super.name);
+    gpu_device->exec_error = 1;  /* release the executor thread */
     return PARSEC_HOOK_RETURN_DISABLE;
 }

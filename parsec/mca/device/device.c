@@ -68,6 +68,12 @@ static int parsec_device_load_balance_allow_cpu = 0;
 int parsec_device_skip_empty_events = 1;
 
 /**
+ * Whether to capture a second thread that submits the kernels of a GPU device
+ * while another thread manages its data movements (disabled by default).
+ */
+int parsec_device_exec_thread = 0;
+
+/**
  * @brief Estimates how many nanoseconds this_task will run on devid
  *
  * @param this_task the task to run
@@ -353,6 +359,11 @@ int parsec_mca_device_init(void)
                                         "that are not strictly necessary (enabled)",
                                         false, false, parsec_device_skip_empty_events,
                                         &parsec_device_skip_empty_events);
+    (void)parsec_mca_param_reg_int_name("device", "exec_thread",
+                                        "Boolean to capture a second thread that submits the kernels of a GPU device "
+                                        "while another thread manages its data movements (disabled)",
+                                        false, false, parsec_device_exec_thread,
+                                        &parsec_device_exec_thread);
     (void)parsec_mca_param_reg_int_name("device", "load_balance_allow_cpu",
                                         "Allow load balancing tasks with GPU incarnations to CPU cores",
                                         false, false, parsec_device_load_balance_allow_cpu, NULL);
