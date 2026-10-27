@@ -17,6 +17,7 @@
 #include "parsec/class/list.h"
 #include "parsec/class/lifo.h"
 #include "parsec/class/parsec_heap.h"
+#include "parsec/class/parsec_obj_freelist.h"
 
 BEGIN_C_DECLS
 
@@ -97,12 +98,11 @@ typedef int (parsec_stage_out_function_t)(parsec_gpu_task_t        *gtask,
                                           uint32_t                  flow_mask,
                                           parsec_gpu_exec_stream_t *gpu_stream);
 
-/* Function type for releasing a device task. The DSL is responsible for allocating such tasks,
- * and this function allows the device engine to delegate the release of such tasks back into
- * the DSL. Once this task called, the device task should not be accessed by the device.
+/* Device task wrapper. The DSL allocates it, and the device engine releases it
+ * with PARSEC_OBJ_RELEASE once done with it: a DSL that needs to control the
+ * disposal of its wrappers creates them with a custom allocator
+ * (passed to PARSEC_OBJ_NEW or PARSEC_OBJ_CONSTRUCT).
  */
-typedef void (*parsec_release_device_task_function_t)(void*);
-
 struct parsec_gpu_task_s {
     parsec_list_item_t                     list_item;
     int32_t                                priority; /**< device task priority, inherited from task if < 0 */
@@ -114,7 +114,6 @@ struct parsec_gpu_task_s {
     parsec_complete_stage_function_t       complete_stage;
     parsec_stage_in_function_t            *stage_in;
     parsec_stage_out_function_t           *stage_out;
-    parsec_release_device_task_function_t  release_device_task;
 #if defined(PARSEC_PROF_TRACE)
     int                                    prof_key_end;
     uint64_t                               prof_event_id;
@@ -147,6 +146,8 @@ struct parsec_gpu_task_s {
         };
     };
 };
+
+PARSEC_DECLSPEC PARSEC_OBJ_CLASS_DECLARATION(parsec_gpu_task_t);
 
 typedef enum parsec_device_transfer_direction_e {
     parsec_device_gpu_transfer_direction_h2d,
@@ -289,6 +290,7 @@ struct parsec_device_gpu_module_s {
     parsec_binheap_t           pending_heap;  /**< manager-private max-heap for priority ordering */
     parsec_lifo_t              gpu_mem_inbox; /**< lock-free LIFO: other manager threads push here */
     struct zone_malloc_s      *memory;
+    parsec_obj_freelist_t      data_copy_freelist;  /**< data copies allocated by the device for its memory */
     parsec_gpu_exec_stream_t **exec_stream;
     size_t                     mem_block_size;
     int64_t                    mem_nb_blocks;

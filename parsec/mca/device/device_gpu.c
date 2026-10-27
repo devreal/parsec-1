@@ -65,6 +65,16 @@ parsec_device_kernel_exec( parsec_device_gpu_module_t      *gpu_device,
 typedef int(*parsec_gpu_step_function_t)(parsec_device_gpu_module_t  *gpu_device,
                                          parsec_gpu_task_t           *gpu_task,
                                          parsec_gpu_exec_stream_t    *gpu_stream);
+
+static void parsec_device_task_t_constructor(parsec_gpu_task_t *gpu_task)
+{
+    /* everything but the list item starts out zeroed, the DSL fills in the rest */
+    memset((char*)gpu_task + sizeof(parsec_list_item_t), 0,
+           sizeof(parsec_gpu_task_t) - sizeof(parsec_list_item_t));
+    gpu_task->priority = -1; // priority is inherited from the task
+}
+PARSEC_OBJ_CLASS_INSTANCE(parsec_gpu_task_t, parsec_list_item_t,
+                          parsec_device_task_t_constructor, NULL);
 static inline int
 parsec_device_check_space_needed(parsec_device_gpu_module_t *gpu_device,
                                  parsec_gpu_task_t *gpu_task)
@@ -481,17 +491,15 @@ parsec_device_data_advise(parsec_device_module_t *dev, parsec_data_t *data, int 
                 return PARSEC_ERROR;
             }
             parsec_gpu_task_t* gpu_task = NULL;
-            gpu_task = (parsec_gpu_task_t*)calloc(1, sizeof(parsec_gpu_task_t));
+            gpu_task = PARSEC_OBJ_NEW(parsec_gpu_task_t);
             gpu_task->task_type = PARSEC_GPU_TASK_TYPE_PREFETCH;
-            gpu_task->release_device_task = free;  /* by default free the device task */
             gpu_task->ec = calloc(1, sizeof(parsec_task_t));
             PARSEC_OBJ_CONSTRUCT(gpu_task->ec, parsec_task_t);
             gpu_task->ec->task_class = &parsec_device_data_prefetch_tc;
             /* The pending heap compares gpu_task->priority, not gpu_task->ec->priority:
              * priority inheritance from ec normally happens in
              * parsec_device_kernel_scheduler(), which this direct-enqueue path bypasses.
-             * Set it explicitly so this task is ranked the same as its ec priority
-             * instead of relying on the calloc()-zeroed default. */
+             * Set it explicitly so this task is ranked the same as its ec priority. */
             gpu_task->priority = gpu_task->ec->priority;
             gpu_task->flow[0] = &parsec_device_data_prefetch_flow;
             gpu_task->flow_nb_elts[0] = data->device_copies[ data->owner_device ]->original->nb_elts;
@@ -663,6 +671,16 @@ parsec_device_memory_reserve( parsec_device_gpu_module_t* gpu_device,
         return PARSEC_ERROR;
     }
 
+    /* the data copies describing the device memory are recycled through a device-local free-list */
+    if( NULL == gpu_device->data_copy_freelist.lifo ) {
+        rc = PARSEC_OBJ_FREELIST_CONSTRUCT(&gpu_device->data_copy_freelist, parsec_data_copy_t);
+        if(PARSEC_SUCCESS != rc) {
+            parsec_warning("GPU[%d:%s] Cannot allocate the free-list of data copies",
+                           gpu_device->super.device_index, gpu_device->super.name);
+            return rc;
+        }
+    }
+
 #if defined(PARSEC_GPU_ALLOC_PER_TILE)
     size_t free_mem = initial_free_mem;
     /*
@@ -682,7 +700,7 @@ parsec_device_memory_reserve( parsec_device_gpu_module_t* gpu_device,
                           gpu_device->super.device_index, gpu_device->super.name,_free_mem, _total_mem, mem_elem_per_gpu);
             break;
         }
-        gpu_elem = PARSEC_OBJ_NEW(parsec_data_copy_t);
+        gpu_elem = PARSEC_OBJ_NEW(parsec_data_copy_t, &gpu_device->data_copy_freelist.super);
         PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                             "GPU[%d:%s] Allocate GPU copy %p [ref_count %d] for data [%p]",
                             gpu_device->super.device_index, gpu_device->super.name,gpu_elem, gpu_elem->super.obj_reference_count, NULL);
@@ -716,6 +734,7 @@ parsec_device_memory_reserve( parsec_device_gpu_module_t* gpu_device,
             parsec_warning("GPU[%d:%s] Allocating %zu bytes of memory on the GPU device failed (initial_free_mem was %zu)",
                            gpu_device->super.device_index, gpu_device->super.name, alloc_size, initial_free_mem);
             gpu_device->memory = NULL;
+            parsec_obj_freelist_destruct(&gpu_device->data_copy_freelist);
             return PARSEC_ERROR;
         }
 
@@ -725,6 +744,7 @@ parsec_device_memory_reserve( parsec_device_gpu_module_t* gpu_device,
         if( gpu_device->memory == NULL ) {
             parsec_warning("GPU[%d:%s] Failed trying to allocate %zu bytes. We tried to do so based on an initial_free_mem of %zu bytes and elt_size of %zu bytes",
                            gpu_device->super.device_index, gpu_device->super.name, alloc_size, initial_free_mem, eltsize);
+            parsec_obj_freelist_destruct(&gpu_device->data_copy_freelist);
             return PARSEC_ERROR;
         }
 
@@ -872,6 +892,17 @@ parsec_device_memory_release( parsec_device_gpu_module_t* gpu_device )
         return rc;
 
     parsec_device_flush_lru(&gpu_device->super);
+
+    if( NULL != gpu_device->data_copy_freelist.lifo ) {
+        /* All data copies allocated by the device must have been released by
+         * now: they keep the free-list as their allocator, and releasing one
+         * once it is gone would fail far from the actual mistake. */
+        int32_t nb_in_use = parsec_obj_freelist_destruct(&gpu_device->data_copy_freelist);
+        if( 0 != nb_in_use ) {
+            parsec_fatal("GPU[%d:%s]: %d data copies allocated by the device are still in use",
+                         gpu_device->super.device_index, gpu_device->super.name, nb_in_use);
+        }
+    }
 
 #if !defined(PARSEC_GPU_ALLOC_PER_TILE)
     assert( NULL != gpu_device->memory );
@@ -1061,7 +1092,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
         }
 
 #if !defined(PARSEC_GPU_ALLOC_PER_TILE)
-        gpu_elem = PARSEC_OBJ_NEW(parsec_data_copy_t);
+        gpu_elem = PARSEC_OBJ_NEW(parsec_data_copy_t, &gpu_device->data_copy_freelist.super);
         PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                              "GPU[%d:%s]:%s: Allocate GPU copy %p sz %zu [ref_count %d] for data %p",
                              gpu_device->super.device_index, gpu_device->super.name, task_name,
@@ -2138,9 +2169,8 @@ parsec_device_send_transfercomplete_cmd_to_device(parsec_data_copy_t *copy,
                                                   parsec_device_module_t *dst_dev)
 {
     parsec_gpu_task_t* gpu_task = NULL;
-    gpu_task = (parsec_gpu_task_t*)calloc(1, sizeof(parsec_gpu_task_t));
+    gpu_task = PARSEC_OBJ_NEW(parsec_gpu_task_t);
     gpu_task->task_type = PARSEC_GPU_TASK_TYPE_D2D_COMPLETE;
-    gpu_task->release_device_task = free;  /* by default free the device task */
     gpu_task->ec = calloc(1, sizeof(parsec_task_t));
     PARSEC_OBJ_CONSTRUCT(gpu_task->ec, parsec_task_t);
     gpu_task->ec->task_class = &parsec_device_d2d_complete_tc;
@@ -2645,9 +2675,8 @@ parsec_device_release_withdrawn_tasks( parsec_device_gpu_module_t* gpu_device,
         PARSEC_LIST_ITEM_SINGLETON(iter);
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream, "GPU[%d:%s]: gpu_task %p freed",
                              gpu_device->super.device_index, gpu_device->super.name, iter);
-        if( NULL != iter->release_device_task ) {
-            iter->release_device_task(iter);
-        }
+        /* the allocator of the wrapper decides how it is disposed of */
+        PARSEC_OBJ_RELEASE(iter);
         cnt++;
         iter = next;
     } while( NULL != iter );
@@ -3912,7 +3941,7 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                     parsec_list_item_ring_push(&task_ring->super, (parsec_list_item_t*)iter->ec);
                 }
             }
-            /* still needs release_device_task via remove_gpu_task below */
+            /* the wrapper is still released in remove_gpu_task below */
             if (NULL == release_ring) {
                 release_ring = iter;
             } else {
@@ -3941,9 +3970,8 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                             gpu_device->super.device_index, gpu_device->super.name,
                             iter);
         PARSEC_LIST_ITEM_SINGLETON(iter);
-        if (NULL != iter->release_device_task) {
-            iter->release_device_task(iter);
-        }
+        /* the allocator of the wrapper decides how it is disposed of */
+        PARSEC_OBJ_RELEASE(iter);
         cnt++;
         iter = next;
     } while (iter != NULL);

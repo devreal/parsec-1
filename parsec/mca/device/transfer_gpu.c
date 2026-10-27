@@ -273,7 +273,6 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
                     parsec_atomic_unlock( &gpu_copy->original->lock );
                     return NULL;
                 }
-                PARSEC_OBJ_CONSTRUCT(d2h_task, parsec_task_t);
             }
             parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
             PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
@@ -306,9 +305,7 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
     d2h_task->taskpool        = NULL;
     d2h_task->locals[0].value = nb_cleaned;
 
-    w2r_task = (parsec_gpu_task_t *)malloc(sizeof(parsec_gpu_task_t));
-    PARSEC_OBJ_CONSTRUCT(w2r_task, parsec_list_item_t);
-    w2r_task->release_device_task   = free;  /* by default free the device task */
+    w2r_task = PARSEC_OBJ_NEW(parsec_gpu_task_t);
     w2r_task->ec                    = (parsec_task_t*)d2h_task;
     w2r_task->task_type             = PARSEC_GPU_TASK_TYPE_D2HTRANSFER;
     w2r_task->last_data_check_epoch = gpu_device->data_avail_epoch - 1;
@@ -330,6 +327,7 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device,
     parsec_gpu_data_copy_t *gpu_copy, *cpu_copy;
     parsec_gpu_d2h_task_t* task = (parsec_gpu_d2h_task_t*)gpu_task->ec;
     parsec_data_t* original;
+    (void)es;
 
     PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,  "D2H[%d:%s] task %p: %d data transferred to host",
                          gpu_device->super.device_index, gpu_device->super.name, (void*)task, task->locals[0].value);
@@ -384,8 +382,10 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device,
 
         parsec_atomic_unlock(&gpu_copy->original->lock);
     }
-    parsec_thread_mempool_free(es->context_mempool, task);
-    free(gpu_task);
+
+    /* the manager may have moved to another thread since the task was allocated */
+    parsec_thread_mempool_free(task->mempool_owner, task);
+    PARSEC_OBJ_RELEASE(gpu_task);
     gpu_device->data_avail_epoch++;
     return 0;
 }

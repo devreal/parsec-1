@@ -2280,9 +2280,7 @@ static parsec_hook_return_t parsec_dtd_gpu_task_submit(parsec_execution_stream_t
 #if defined(PARSEC_HAVE_DEV_CUDA_SUPPORT) || defined(PARSEC_HAVE_DEV_HIP_SUPPORT) || defined(PARSEC_HAVE_DEV_LEVEL_ZERO_SUPPORT)
     parsec_dtd_task_t *dtd_task = (parsec_dtd_task_t *)this_task;
     parsec_dtd_task_class_t *dtd_tc = (parsec_dtd_task_class_t*)this_task->task_class;
-    parsec_gpu_task_t *gpu_task = (parsec_gpu_task_t *) calloc(1, sizeof(parsec_gpu_task_t));
-    PARSEC_OBJ_CONSTRUCT(gpu_task, parsec_list_item_t);
-    gpu_task->release_device_task = free;  /* by default free the device task */
+    parsec_gpu_task_t *gpu_task = PARSEC_OBJ_NEW(parsec_gpu_task_t);
     gpu_task->ec = (parsec_task_t *) this_task;
     gpu_task->submit = dtd_tc->gpu_func_ptr;
     gpu_task->task_type = 0;
@@ -2686,7 +2684,6 @@ parsec_dtd_create_and_initialize_task(parsec_dtd_taskpool_t *dtd_tp,
 
     assert(this_task->super.super.super.obj_reference_count == 1);
 
-    PARSEC_OBJ_CONSTRUCT(&this_task->super, parsec_task_t);
     this_task->orig_task = NULL;
     this_task->super.taskpool = (parsec_taskpool_t *)dtd_tp;
     this_task->ht_item.key = (parsec_key_t)(uintptr_t)(dtd_tp->task_id++);
