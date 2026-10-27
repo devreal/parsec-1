@@ -108,7 +108,7 @@ struct parsec_gpu_task_s {
     int32_t                                priority; /**< device task priority, inherited from task if < 0 */
     uint64_t                               heap_seq; /**< FIFO tie-break stamp, set by parsec_heap_push(); see pending_heap */
     uint16_t                               task_type;
-    uint16_t                               pushout;
+    uint32_t                               pushout;
     int32_t                                last_status;
     parsec_advance_task_function_t         submit;
     parsec_complete_stage_function_t       complete_stage;
