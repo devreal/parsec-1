@@ -1320,8 +1320,11 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
 
 /**
  * @brief Generic fallback for parsec_device_memcpy_multi_async_fn_t: issues @p nb_items
- *    individual gpu->memcpy_async() calls. Does not stop at the first failure -- every
- *    item is attempted regardless, and the first error encountered (if any) is returned.
+ *    individual gpu->memcpy_async() calls. Stops at the first failure instead of
+ *    submitting the remaining items: items already issued before the failure are
+ *    genuinely queued on the stream (the caller must still account for them, e.g.
+ *    by recording an event), so continuing past a failure would only grow that set
+ *    without changing the overall (still-failing) outcome.
  *    Used by backends that do not (yet) provide a native batched copy primitive.
  */
 int
@@ -1329,14 +1332,14 @@ parsec_device_generic_memcpy_multi_async(parsec_device_gpu_module_t *gpu, parsec
                                          void **dsts, void **srcs, size_t *sizes,
                                          parsec_device_transfer_direction_t *directions, int nb_items)
 {
-    int ret, rc = PARSEC_SUCCESS;
+    int ret;
 
     for(int i = 0; i < nb_items; i++) {
         ret = gpu->memcpy_async(gpu, gpu_stream, dsts[i], srcs[i], sizes[i], directions[i]);
-        if( (PARSEC_SUCCESS == rc) && (PARSEC_SUCCESS != ret) )
-            rc = ret;
+        if( PARSEC_SUCCESS != ret )
+            return ret;
     }
-    return rc;
+    return PARSEC_SUCCESS;
 }
 
 /* Append the copies needed to stage in every flow set in flow_mask of gtask to
@@ -1386,6 +1389,9 @@ parsec_default_gpu_stage_in_collect(parsec_gpu_task_t                  *gtask,
         sizes[n]      = count;
         directions[n] = dir;
         n++;
+        /* All flows are batched into a single transfer issued on *dev, so they must
+         * all target the same device (data_out is the copy reserved on the pushing device). */
+        assert((NULL == *dev) || (*dev == dst_dev));
         *dev = dst_dev;
     }
     *nb_items = n;
@@ -1479,6 +1485,9 @@ parsec_default_gpu_stage_out_collect(parsec_gpu_task_t                  *gtask,
             sizes[n]      = count;
             directions[n] = dir;
             n++;
+            /* All flows are batched into a single transfer issued on *dev, so they must
+             * all originate from the same device (data_out is the copy on the popping device). */
+            assert((NULL == *dev) || (*dev == src_dev));
             *dev = src_dev;
         }
     }
@@ -1835,6 +1844,7 @@ parsec_device_data_stage_in( parsec_device_gpu_module_t* gpu_device,
     gpu_task->sources[flow->flow_index] = candidate;  /* save the candidate for release on transfer completion */
     /* Mark this flow as needing a transfer from the source device; the caller issues
      * the actual gpu_task->stage_in call once, covering every flow marked this way. */
+    assert(flow->flow_index < (sizeof(*transfer_mask)*8));
     *transfer_mask |= (1U << flow->flow_index);
     assert(candidate_dev->super.device_index < gpu_device->super.data_in_array_size);
     gpu_device->super.data_in_from_device[candidate_dev->super.device_index] += nb_elts;
@@ -2974,7 +2984,18 @@ parsec_device_kernel_push_task( parsec_device_gpu_module_t      *gpu_device,
         if( ret < 0 ) {
             /* Transfers already decided for earlier flows are left in *transfer_mask:
              * those flows are already marked UNDER_TRANSFER and the caller must issue
-             * a matching physical copy for them before propagating this error/retry. */
+             * a matching physical copy for them before propagating this error/retry.
+             *
+             * On a retry (AGAIN/NEXT) nothing releases that state here: complete_stage
+             * is only set once the whole push succeeds, so parsec_device_callback_complete_push
+             * does not run for this attempt. The destination copies stay UNDER_TRANSFER and
+             * the source readers stay held until the task is pushed again. On that push the
+             * flows take the already-under-transfer branch of parsec_device_data_stage_in
+             * without re-issuing a copy, and the completion callback of the successful push
+             * clears the state. With AGAIN the flushed copies are covered by the event
+             * progress_stream records for this attempt; with NEXT no event is recorded, so
+             * this is only safe because the input stream is in-order and the event recorded
+             * by the later successful push covers the copies issued here. */
             return ret;
         }
         how_many += ret;
@@ -3201,6 +3222,10 @@ parsec_device_kernel_pop_task( parsec_device_gpu_module_t   *gpu_device,
             gpu_copy = this_task->data[i].data_out;
             /* If the gpu copy is not owned by parsec, we don't manage it at all */
             if( 0 == (gpu_copy->flags & PARSEC_DATA_FLAG_PARSEC_OWNED) ) continue;
+            /* Sanity check: MAX_PARAM_COUNT may be increased to accommodate more parameters,
+             * but the transfer_mask must still be able to represent all of them.
+             */
+            assert(i < (int)(sizeof(*transfer_mask)*8));
             *transfer_mask |= (1U << i);
             how_many++;
         }
@@ -3334,6 +3359,7 @@ parsec_device_kernel_pop_task( parsec_device_gpu_module_t   *gpu_device,
 #endif
                 /* Defer the actual transfer: accumulate this flow into transfer_mask,
                  * the caller issues the transfers of all flows (and tasks) at once. */
+                assert(flow->flow_index < (sizeof(*transfer_mask)*8));
                 *transfer_mask |= (1U << flow->flow_index);
                 pending_bytes += nb_elts; /* TODO: not hardcoded, use datatype size */
                 nb_pushout++;
