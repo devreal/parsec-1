@@ -144,6 +144,60 @@ FIFO after the recorded device event completes. The normal data retrieval,
 epilog, ownership, pushout, and task completion paths then process the tasks one
 at a time.
 
+Batch groups
+------------
+
+Before the submit hook runs, the device moves the tasks of a batch group
+together through its pending queue and its stage-in and stage-out streams, so
+that they reach the execution streams together and can be collected into the
+same batch. By default, the tasks sharing the hook of their selected
+incarnation form a group.
+
+A DSL can group tasks differently, for example tasks of different task classes
+that run compatible kernels, by setting `gpu_task->batch_key` to a pointer
+shared by all tasks of the group, and only by them, before handing the task to
+the device:
+
+```c
+gpu_task->batch_key = my_batch_group; /* any address identifying the group */
+```
+
+Tasks with a `batch_key` are never grouped with tasks without one. The group
+only drives how tasks move through the device; the collector callback still
+decides which candidates join a batch.
+
+Waiting for more tasks
+----------------------
+
+A submit hook can return `PARSEC_HOOK_RETURN_BATCH_WAIT`, before queuing any
+work on `gpu_stream`, to ask the device to wait for more tasks before executing
+the batch. The device parks `gpu_task` together with the tasks already
+collected into its ring, keeps ingesting and staging in new tasks, and calls the
+submit hook again on a later visit of the stream. The ring is kept, and
+`parsec_gpu_task_collect_batch()` appends the new tasks to it. While a head is
+parked, pending tasks of its batch group are left for it instead of starting a
+competing batch.
+
+On re-entry, `gpu_task->last_status == PARSEC_HOOK_RETURN_BATCH_WAIT`;
+`parsec_gpu_task_batch_size()` returns the size of the batch collected so far
+(callbacks that count accepted tasks must account for it), and
+`parsec_gpu_task_batch_wait_elapsed()` the time waited:
+
+```c
+batch_data.accepted = parsec_gpu_task_batch_size(gpu_task) - 1;
+nb_batched = parsec_gpu_task_collect_batch(gpu_stream, gpu_task,
+                                           gemm_batch_match, &batch_data);
+if( (parsec_gpu_task_batch_size(gpu_task) < min_batch_size) &&
+    (parsec_gpu_task_batch_wait_elapsed(gpu_task) < max_wait) ) {
+    return PARSEC_HOOK_RETURN_BATCH_WAIT;
+}
+```
+
+The runtime never forces a parked head to execute: a hook that keeps returning
+`PARSEC_HOOK_RETURN_BATCH_WAIT` while the expected tasks never arrive, or depend
+on the parked tasks, prevents these tasks from running. Always bound the wait,
+e.g. with a minimum batch size and a timeout.
+
 Iterating over the returned ring
 --------------------------------
 

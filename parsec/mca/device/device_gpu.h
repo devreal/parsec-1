@@ -111,6 +111,11 @@ struct parsec_gpu_task_s {
     uint16_t                               task_type;
     uint32_t                               pushout;
     int32_t                                last_status;
+    const void                            *batch_key; /**< identifies the batch group of the task: tasks with the
+                                                       *   same non-NULL key move together through the device
+                                                       *   stages and compete for a single batch. If NULL, tasks
+                                                       *   are grouped by the hook of their selected incarnation.
+                                                       *   Set by the DSL, see parsec_gpu_task_collect_batch(). */
     parsec_time_t                          batch_wait_start; /**< set when the submit function first returned
                                                               *   PARSEC_HOOK_RETURN_BATCH_WAIT, see
                                                               *   parsec_gpu_task_batch_wait_elapsed() */
@@ -416,8 +421,20 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_
  *     counting accepted tasks need to account for it), and the time waited
  *     with parsec_gpu_task_batch_wait_elapsed().
  * Each execution stream holds at most one parked head. While a head is parked,
- * pending tasks with the same incarnation are left for it to collect instead
- * of starting a competing batch.
+ * pending tasks of the same batch group are left for it to collect instead of
+ * starting a competing batch.
+ *
+ * Batch groups:
+ * The device moves the tasks of a batch group together through its stages
+ * (pending queue, stage in, stage out), so that they arrive together on the
+ * execution streams, and lets a single head at a time wait for the tasks of a
+ * group. By default, the tasks sharing the hook of their selected incarnation
+ * form a group. A DSL can group tasks differently, e.g. tasks of different task
+ * classes running compatible kernels, by setting gpu_task->batch_key to a
+ * pointer shared by all tasks of the group (and only by them) before handing
+ * the task to the device. Tasks with a batch_key are never grouped with tasks
+ * without one. The group only drives how tasks move through the device: the
+ * callback still decides which candidates join a batch.
  *
  * WARNING: the runtime never forces a parked head to execute. A submit
  * function that keeps returning PARSEC_HOOK_RETURN_BATCH_WAIT, while the tasks

@@ -2003,13 +2003,19 @@ parsec_gpu_task_selected_chore_allows_batch(parsec_task_t *task,
 }
 
 /**
- * Returns 1 if the two have the same chore hook.
+ * Returns 1 if the two tasks belong to the same batch group: tasks of a group move
+ * together through the device stages and compete for a single batch. Tasks with a
+ * batch_key belong to the group of their key, the other tasks to the group of the
+ * hook of their selected incarnation.
  */
-static inline int parsec_gpu_task_same_chore(parsec_gpu_task_t *task1, parsec_gpu_task_t *task2)
+static inline int parsec_gpu_task_same_batch(parsec_gpu_task_t *task1, parsec_gpu_task_t *task2)
 {
     parsec_task_t *t1 = task1->ec;
     parsec_task_t *t2 = task2->ec;
 
+    if( (NULL != task1->batch_key) || (NULL != task2->batch_key) ) {
+        return task1->batch_key == task2->batch_key;
+    }
     if( (NULL == t1) ||
         (NULL == t1->task_class) ||
         (NULL == t2) ||
@@ -2547,8 +2553,9 @@ parsec_gpu_task_ring_next_unit( parsec_gpu_task_t* iter,
  * Extract the next ring of tasks to progress from the pending queue of @p stream.
  * Without batching, the ring contains a single task. With batching, the ring
  * gathers up to PARSEC_DEVICE_MAX_BATCH_SIZE pending tasks whose selected
- * incarnation allows batching on @p gpu_device and that share the incarnation
- * of the first task. Pending tasks that do not match are skipped and left in
+ * incarnation allows batching on @p gpu_device and that belong to the batch
+ * group of the first task (see parsec_gpu_task_same_batch()). Pending tasks
+ * that do not match are skipped and left in
  * the queue, in order, for the following rings. A task that is not batchable
  * always forms a ring of its own.
  */
@@ -2577,7 +2584,7 @@ parsec_device_stream_grab_ring( parsec_device_gpu_module_t* gpu_device,
         next = (parsec_list_item_t*)item->list_next;
         task = (parsec_gpu_task_t*)item;
         if( !parsec_gpu_task_selected_chore_allows_batch(task->ec, (parsec_device_module_t*)gpu_device) ||
-            !parsec_gpu_task_same_chore(task, ring) ) {
+            !parsec_gpu_task_same_batch(task, ring) ) {
             /* the task does not match the current batch, leave it for a following one */
             continue;
         }
@@ -2603,7 +2610,8 @@ parsec_device_stream_delay_batch( parsec_gpu_exec_stream_t* stream )
 
 /**
  * Returns true if a batch head parked by PARSEC_HOOK_RETURN_BATCH_WAIT on one of
- * the execution streams of @p gpu_device shares the incarnation of @p task. The
+ * the execution streams of @p gpu_device belongs to the batch group of @p task
+ * (see parsec_gpu_task_same_batch()). The
  * task is then left pending for the parked head to collect, instead of starting
  * a competing batch.
  */
@@ -2613,7 +2621,7 @@ parsec_device_batch_is_parked( parsec_device_gpu_module_t* gpu_device,
 {
     for( int i = 2; i < gpu_device->num_exec_streams; i++ ) {
         parsec_gpu_task_t *head = gpu_device->exec_stream[i]->batch_waiting;
-        if( (NULL != head) && parsec_gpu_task_same_chore(head, task) )
+        if( (NULL != head) && parsec_gpu_task_same_batch(head, task) )
             return true;
     }
     return false;
@@ -2626,7 +2634,7 @@ parsec_device_batch_is_parked( parsec_device_gpu_module_t* gpu_device,
  * batchable tasks are delayed (see parsec_device_stream_delay_batch()), nothing
  * is submitted: the non-batchable tasks with a lower priority wait as well, so
  * that they don't keep the stream busy and delay the batch further.
- * If it is batchable and a batch head with the same incarnation is parked (see
+ * If it is batchable and a batch head of the same batch group is parked (see
  * parsec_device_batch_is_parked()), or if @p skip_batch is true, the batchable
  * tasks are left pending and only the non-batchable tasks are considered.
  */
@@ -3223,7 +3231,7 @@ parsec_device_kernel_push( parsec_device_gpu_module_t      *gpu_device,
     for( int t = 0; t < nb_tasks; t++ ) {
         masks[t] = 0;
         if( out_of_memory ) {
-            /* All tasks of the ring share the same incarnation: once a task fails to
+            /* All tasks of the ring belong to the same batch group: once a task fails to
              * find room on the device the following ones would most likely fail too,
              * don't waste time scanning the LRU for them. */
             tasks[t]->last_status = PARSEC_HOOK_RETURN_NEXT;
@@ -3988,7 +3996,8 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
             if (NULL == candidate) {
                 break;
             }
-            if (!parsec_gpu_task_same_chore(gpu_task, candidate)) {
+            if (!parsec_gpu_task_same_batch(gpu_task, candidate) ||
+                !parsec_gpu_task_selected_chore_allows_batch(candidate->ec, (parsec_device_module_t*)gpu_device)) {
                 break;
             }
             // remove the item from the heap
