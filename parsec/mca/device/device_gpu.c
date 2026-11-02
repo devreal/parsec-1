@@ -2738,13 +2738,16 @@ parsec_device_stream_take_delayed( parsec_device_gpu_module_t* gpu_device,
 }
 
 /**
- * Release the tasks in @p ring that have been withdrawn from the device by a
- * data movement stage while other tasks are still managed by the device (so
- * that this thread remains the manager of the device).
+ * Release the GPU tasks in @p ring (a single task or a task ring), and return the
+ * number of GPU tasks released. The allocator of a GPU task decides how it is
+ * disposed of: the GPU task may be embedded in its parent task, so it must be
+ * released before its parent task is handed back to the runtime (scheduled,
+ * rescheduled or released). The caller remains in charge of accounting for the
+ * released tasks in the device mutex.
  */
-static void
-parsec_device_release_withdrawn_tasks( parsec_device_gpu_module_t* gpu_device,
-                                       parsec_gpu_task_t* ring )
+static inline int
+parsec_device_release_gpu_tasks( parsec_device_gpu_module_t* gpu_device,
+                                 parsec_gpu_task_t* ring )
 {
     parsec_gpu_task_t *iter = ring, *next;
     int cnt = 0;
@@ -2754,11 +2757,25 @@ parsec_device_release_withdrawn_tasks( parsec_device_gpu_module_t* gpu_device,
         PARSEC_LIST_ITEM_SINGLETON(iter);
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream, "GPU[%d:%s]: gpu_task %p freed",
                              gpu_device->super.device_index, gpu_device->super.name, iter);
-        /* the allocator of the wrapper decides how it is disposed of */
         PARSEC_OBJ_RELEASE(iter);
         cnt++;
         iter = next;
     } while( NULL != iter );
+    (void)gpu_device;
+    return cnt;
+}
+
+/**
+ * Release the tasks in @p ring that have been withdrawn from the device by a
+ * data movement stage while other tasks are still managed by the device (so
+ * that this thread remains the manager of the device).
+ */
+static void
+parsec_device_release_withdrawn_tasks( parsec_device_gpu_module_t* gpu_device,
+                                       parsec_gpu_task_t* ring )
+{
+    int cnt = parsec_device_release_gpu_tasks(gpu_device, ring);
+
     /* The tasks still managed by the device keep the count positive. Beware:
      * prefetch tasks are pushed into the pending queue without being accounted
      * for in the mutex, so the count cannot be checked here. */
@@ -3783,7 +3800,6 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     parsec_gpu_task_t *gpu_task = (parsec_gpu_task_t*)_gpu_task;
     parsec_task_t *task_ring = NULL;
     parsec_gpu_task_t *iter = NULL;
-    parsec_gpu_task_t *release_ring = NULL;
     int clear_device_counter = PARSEC_DEVICE_CLEAR_EVERY;
     int cnt = 0;
 #if defined(PARSEC_DEBUG_NOISIER)
@@ -3925,11 +3941,13 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                another incarnation of the task will be executed. */
             if( NULL != progress_task ) {
                 assert(PARSEC_HOOK_RETURN_NEXT == rc);
+                parsec_task_t *task = progress_task->ec;
                 parsec_device_kernel_cleanout(gpu_device, progress_task);
-                __parsec_reschedule(es, progress_task->ec);
-                gpu_task = progress_task;
+                /* release the GPU task before its parent task, see parsec_device_release_gpu_tasks() */
+                cnt = parsec_device_release_gpu_tasks(gpu_device, progress_task);
                 progress_task = NULL;
-                goto remove_gpu_task;
+                __parsec_reschedule(es, task);
+                goto release_gpu_ownership;
             }
             gpu_task = NULL;
             goto fetch_task_from_shared_queue;
@@ -4017,40 +4035,39 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
  complete_task:
     assert( NULL != gpu_task );
     task_ring = NULL;
-    release_ring = NULL;
+    cnt = 0;
     iter = gpu_task;
     do {
         /* Take the first item off the ring and process it */
         parsec_gpu_task_t *next = (parsec_gpu_task_t*)parsec_list_item_ring_chop((parsec_list_item_t*)iter);
+        parsec_task_t *task = iter->ec;
         PARSEC_LIST_ITEM_SINGLETON(iter);
 
         PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,  "GPU[%d:%s]:\tComplete %s",
                              gpu_device->super.device_index, gpu_device->super.name,
-                             parsec_task_snprintf(tmp, MAX_TASK_STRLEN, iter->ec));
+                             parsec_task_snprintf(tmp, MAX_TASK_STRLEN, task));
         if (iter->task_type == PARSEC_GPU_TASK_TYPE_D2HTRANSFER) {
             parsec_gpu_complete_w2r_task(gpu_device, iter, es);
             active_w2r_tasks--;
-            /* d2h transfers don't go through remove_gpu_task */
+            /* d2h transfers are not accounted for in the device mutex */
         } else {
-            if (iter->task_type == PARSEC_GPU_TASK_TYPE_D2D_COMPLETE) {
-                free( iter->ec );
-                iter->ec = NULL;
-            } else {
+            bool d2d_complete = (iter->task_type == PARSEC_GPU_TASK_TYPE_D2D_COMPLETE);
+            if (!d2d_complete) {
                 parsec_device_kernel_epilog( gpu_device, iter );
-                iter->ec->status = PARSEC_TASK_STATUS_COMPLETE;
-                gpu_device->super.executed_tasks++;
-                PARSEC_LIST_ITEM_SINGLETON(iter->ec);
-                if (NULL == task_ring) {
-                    task_ring = iter->ec;
-                } else {
-                    parsec_list_item_ring_push(&task_ring->super, (parsec_list_item_t*)iter->ec);
-                }
             }
-            /* the wrapper is still released in remove_gpu_task below */
-            if (NULL == release_ring) {
-                release_ring = iter;
+            /* release the GPU task before its parent task, see parsec_device_release_gpu_tasks() */
+            cnt += parsec_device_release_gpu_tasks(gpu_device, iter);
+            if (d2d_complete) {
+                free( task );
             } else {
-                parsec_list_item_ring_push((parsec_list_item_t*)release_ring, (parsec_list_item_t*)iter);
+                task->status = PARSEC_TASK_STATUS_COMPLETE;
+                gpu_device->super.executed_tasks++;
+                PARSEC_LIST_ITEM_SINGLETON(task);
+                if (NULL == task_ring) {
+                    task_ring = task;
+                } else {
+                    parsec_list_item_ring_push(&task_ring->super, (parsec_list_item_t*)task);
+                }
             }
         }
         iter = next;
@@ -4061,26 +4078,20 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     }
     iter = NULL;
     task_ring = NULL;
-    gpu_task = release_ring;
-    release_ring = NULL;
+    gpu_task = NULL;
+    if (0 == cnt) {
+        goto fetch_task_from_shared_queue;
+    }
+    goto release_gpu_ownership;
+
  remove_gpu_task:
     if (gpu_task == NULL) {
         goto fetch_task_from_shared_queue;
     }
-    iter = gpu_task;
-    cnt = 0;
-    do {
-        parsec_gpu_task_t *next = (parsec_gpu_task_t*)parsec_list_item_ring_chop((parsec_list_item_t*)iter);
-        PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream, "GPU[%d:%s]: gpu_task %p freed",
-                            gpu_device->super.device_index, gpu_device->super.name,
-                            iter);
-        PARSEC_LIST_ITEM_SINGLETON(iter);
-        /* the allocator of the wrapper decides how it is disposed of */
-        PARSEC_OBJ_RELEASE(iter);
-        cnt++;
-        iter = next;
-    } while (iter != NULL);
+    cnt = parsec_device_release_gpu_tasks(gpu_device, gpu_task);
+    gpu_task = NULL;
 
+ release_gpu_ownership:
     rc = parsec_atomic_fetch_sub_int32( &(gpu_device->mutex), cnt ) - cnt;
 
     if( 0 == rc ) {  /* I was the last one */

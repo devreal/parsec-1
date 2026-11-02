@@ -383,9 +383,10 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device,
         parsec_atomic_unlock(&gpu_copy->original->lock);
     }
 
-    /* the manager may have moved to another thread since the task was allocated */
-    parsec_thread_mempool_free(task->mempool_owner, task);
+    /* release the GPU task before its parent task (see parsec_device_kernel_scheduler()).
+     * The manager may have moved to another thread since the task was allocated. */
     PARSEC_OBJ_RELEASE(gpu_task);
+    parsec_thread_mempool_free(task->mempool_owner, task);
     gpu_device->data_avail_epoch++;
     return 0;
 }
