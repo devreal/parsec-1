@@ -18,6 +18,7 @@
 #include "parsec/class/lifo.h"
 #include "parsec/class/parsec_heap.h"
 #include "parsec/class/parsec_obj_freelist.h"
+#include "parsec/os-spec-timing.h"
 
 BEGIN_C_DECLS
 
@@ -110,6 +111,9 @@ struct parsec_gpu_task_s {
     uint16_t                               task_type;
     uint32_t                               pushout;
     int32_t                                last_status;
+    parsec_time_t                          batch_wait_start; /**< set when the submit function first returned
+                                                              *   PARSEC_HOOK_RETURN_BATCH_WAIT, see
+                                                              *   parsec_gpu_task_batch_wait_elapsed() */
     parsec_advance_task_function_t         submit;
     parsec_complete_stage_function_t       complete_stage;
     parsec_stage_in_function_t            *stage_in;
@@ -309,6 +313,9 @@ struct parsec_gpu_exec_stream_s {
     int32_t                           end;
     parsec_list_t                    *fifo_pending;
     parsec_list_t                    *fifo_batch;  /* batchable tasks pending on execution streams */
+    struct parsec_gpu_task_s         *batch_waiting; /* batch head (with its ring of followers) parked
+                                                      * by PARSEC_HOOK_RETURN_BATCH_WAIT, execution
+                                                      * streams only */
     parsec_gpu_workspace_t           *workspace;
     parsec_info_object_array_t        infos; /**< Per-stream info objects are stored here */
 
@@ -384,15 +391,77 @@ int parsec_gpu_complete_w2r_task(parsec_device_gpu_module_t *gpu_device, parsec_
  * does not support batching on that same selected device are skipped without
  * calling the callback.
  *
- * Returns the number of additional tasks appended to batch_head's ring on
- * success, or the negative callback error code. If an error is returned, tasks
- * already accepted remain attached to batch_head and the remaining candidates
- * stay in their pending queues.
+ * Tasks are appended to batch_head's ring: if batch_head already carries
+ * followers (a head resumed after PARSEC_HOOK_RETURN_BATCH_WAIT, see below),
+ * they are kept and the new tasks are added after them.
+ *
+ * Returns the number of additional tasks appended to batch_head's ring by this
+ * call on success, or the negative callback error code. If an error is
+ * returned, tasks already accepted remain attached to batch_head and the
+ * remaining candidates stay in their pending queues.
+ *
+ * Waiting for more tasks:
+ * The submit function of a batch head may return PARSEC_HOOK_RETURN_BATCH_WAIT
+ * to ask the device to wait for more tasks before executing the batch. The
+ * head is parked on its execution stream together with the followers it
+ * already collected, the thread managing the device moves on to ingest and
+ * stage in new tasks, and the submit function is called again for the parked
+ * head on a later visit of the stream, with its ring of followers intact, so
+ * that it can collect the new tasks. The submit function:
+ *   - must return PARSEC_HOOK_RETURN_BATCH_WAIT before queuing any work on
+ *     gpu_stream;
+ *   - can detect that it is called for a parked head with
+ *     gpu_task->last_status == PARSEC_HOOK_RETURN_BATCH_WAIT, get the size of
+ *     the batch collected so far with parsec_gpu_task_batch_size() (callbacks
+ *     counting accepted tasks need to account for it), and the time waited
+ *     with parsec_gpu_task_batch_wait_elapsed().
+ * Each execution stream holds at most one parked head. While a head is parked,
+ * pending tasks with the same incarnation are left for it to collect instead
+ * of starting a competing batch.
+ *
+ * WARNING: the runtime never forces a parked head to execute. A submit
+ * function that keeps returning PARSEC_HOOK_RETURN_BATCH_WAIT, while the tasks
+ * it waits for never arrive (or depend on the parked tasks), prevents these
+ * tasks from executing and keeps the thread managing the device busy forever.
+ * Applications must bound the wait, e.g. with a minimum batch size and a
+ * timeout. Also note that the execution of the head is traced from its first
+ * submission attempt, so the trace includes the time spent waiting.
  */
 int parsec_gpu_task_collect_batch(parsec_gpu_exec_stream_t *gpu_stream,
                                   parsec_gpu_task_t *batch_head,
                                   parsec_gpu_task_batch_cb_t callback,
                                   void *callback_data);
+
+/**
+ * Returns the number of tasks in the batch headed by @p batch_head, including
+ * batch_head itself.
+ */
+static inline int
+parsec_gpu_task_batch_size(parsec_gpu_task_t *batch_head)
+{
+    parsec_list_item_t *item = &batch_head->list_item;
+    int nb = 1;
+
+    for( item = (parsec_list_item_t*)item->list_next;
+         item != &batch_head->list_item;
+         item = (parsec_list_item_t*)item->list_next ) {
+        nb++;
+    }
+    return nb;
+}
+
+/**
+ * Returns the time (in TIMER_UNIT, see parsec/os-spec-timing.h) since the
+ * submit function of @p batch_head first returned PARSEC_HOOK_RETURN_BATCH_WAIT,
+ * or 0 if the head is not waiting.
+ */
+static inline uint64_t
+parsec_gpu_task_batch_wait_elapsed(parsec_gpu_task_t *batch_head)
+{
+    if( PARSEC_HOOK_RETURN_BATCH_WAIT != batch_head->last_status )
+        return 0;
+    return diff_time(batch_head->batch_wait_start, take_time());
+}
 
 void parsec_device_enable_debug(void);
 

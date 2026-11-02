@@ -53,6 +53,8 @@ static int P = -1;
 static int Q = -1;
 static int cuda_max_batch_size = 32;
 static int cuda_max_submitted_batches = 4;
+static int cuda_min_batch_size = 0;       /* wait for batches of at least this size (0: don't wait) */
+static int cuda_batch_wait_us = 100;      /* but no longer than this (assumes a nanosecond TIMER_UNIT) */
 
 typedef enum {
     GEMM_CUDA_BATCH_NONE,
@@ -560,18 +562,23 @@ int gemm_kernel_cuda(parsec_device_gpu_module_t *gpu_device,
     }
 
     if( gemm_cuda_batch_enabled() && (cuda_max_batch_size > 1) ) {
+        /* A head resumed after PARSEC_HOOK_RETURN_BATCH_WAIT keeps the tasks it
+         * already collected, account for them. */
         gemm_cuda_batch_match_data_t batch_data = {
             .max_batch_size = cuda_max_batch_size,
-            .accepted = 0
+            .accepted = parsec_gpu_task_batch_size(gpu_task) - 1
         };
         int nb_batched = parsec_gpu_task_collect_batch(gpu_stream, gpu_task,
                                                        gemm_cuda_batch_match, &batch_data);
-        if( GEMM_CUDA_BATCH_LIMIT_REACHED == nb_batched ) {
-            nb_batched = batch_data.accepted;
-        } else if( nb_batched < 0 ) {
+        if( (GEMM_CUDA_BATCH_LIMIT_REACHED != nb_batched) && (nb_batched < 0) ) {
             return nb_batched;
         }
-        batch_count += nb_batched;
+        batch_count = parsec_gpu_task_batch_size(gpu_task);
+        /* Wait for more tasks until the batch is large enough, or we waited long enough */
+        if( (batch_count < cuda_min_batch_size) &&
+            (parsec_gpu_task_batch_wait_elapsed(gpu_task) < (uint64_t)cuda_batch_wait_us * 1000) ) {
+            return PARSEC_HOOK_RETURN_BATCH_WAIT;
+        }
     }
 
     one_device = parsec_info_get(&gpu_device->super.infos, Cu1);
@@ -933,13 +940,15 @@ int main(int argc, char **argv)
                 {"batch-mode", required_argument, 0, 'B'},
                 {"batch-size", required_argument, 0, 'S'},
                 {"batch-slots", required_argument, 0, 'L'},
+                {"batch-min", required_argument, 0, 'W'},
+                {"batch-wait", required_argument, 0, 'T'},
                 {"Debug",   required_argument, 0, 'D'},
                 {"Alarm",   required_argument, 0, 'A'},
                 {"help",    no_argument,       0, 'h'},
                 {0, 0,                         0, 0}
         };
 
-        int c = getopt_long(argc, argv, "M:N:K:m:n:k:P:Q:t:d:B:S:L:D:A:vbh",
+        int c = getopt_long(argc, argv, "M:N:K:m:n:k:P:Q:t:d:B:S:L:W:T:D:A:vbh",
                             long_options, &option_index);
         if( c == -1 )
             break;
@@ -987,6 +996,12 @@ int main(int argc, char **argv)
             case 'L':
                 cuda_max_submitted_batches = gemm_parse_positive_int_arg("--batch-slots", optarg);
                 break;
+            case 'W':
+                cuda_min_batch_size = gemm_parse_positive_int_arg("--batch-min", optarg);
+                break;
+            case 'T':
+                cuda_batch_wait_us = gemm_parse_positive_int_arg("--batch-wait", optarg);
+                break;
             case 'd':
                 if(strcasecmp(optarg, "GPU") == 0) {
                     device=PARSEC_DEV_CUDA;
@@ -1033,7 +1048,11 @@ int main(int argc, char **argv)
                             "                                 batch (default: %d)\n"
                             "   --batch-slots|-L:             maximum number of in-flight cuBLAS\n"
                             "                                 batched submissions per stream (default: %d)\n"
-                            "   --verbose|-v:                 display which GEMM runs on which GPU\n"
+                            "   --batch-min|-W:               wait for CUDA batches of at least this many\n"
+                            "                                 GEMM tasks (default: don't wait)\n"
+                            "   --batch-wait|-T:              maximum time to wait for a CUDA batch to\n"
+                            "                                 reach --batch-min, in us (default: %d)\n"
+                            "   --verbose|-v:                display which GEMM runs on which GPU\n"
                             "                                 as execution is unfolding\n"
                             "   --help|-h|-?:                 display this help\n"
                             "   --debug|-D:                   blocks the process passed as parameter and\n"
@@ -1047,7 +1066,8 @@ int main(int argc, char **argv)
                             "    Use DPLASMA or other linear algebra libraries written on top of PaRSEC to evaluate this.\n"
                             "\n",
                             argv[0], gemm_cuda_batch_mode_name(),
-                            cuda_max_batch_size, cuda_max_submitted_batches);
+                            cuda_max_batch_size, cuda_max_submitted_batches,
+                            cuda_batch_wait_us);
                 }
 #if defined(PARSEC_HAVE_MPI)
                 MPI_Finalize();

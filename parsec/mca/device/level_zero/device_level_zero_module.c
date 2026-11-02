@@ -328,6 +328,7 @@ int parsec_level_zero_module_init( int dev_id, parsec_device_level_zero_driver_t
         exec_stream->fifo_pending = (parsec_list_t*)PARSEC_OBJ_NEW(parsec_list_t);
         PARSEC_OBJ_CONSTRUCT(exec_stream->fifo_pending, parsec_list_t);
         exec_stream->fifo_batch   = PARSEC_OBJ_NEW(parsec_list_t);
+        exec_stream->batch_waiting = NULL;
         exec_stream->tasks    = (parsec_gpu_task_t**)malloc(exec_stream->max_events
                                                             * sizeof(parsec_gpu_task_t*));
         level_zero_stream->fences   = (ze_fence_handle_t*)malloc(exec_stream->max_events * sizeof(ze_fence_handle_t));
@@ -546,6 +547,7 @@ parsec_level_zero_module_fini(parsec_device_module_t* device)
         if( NULL != exec_stream->fifo_batch ) {
             PARSEC_OBJ_RELEASE(exec_stream->fifo_batch);
         }
+        assert(NULL == exec_stream->batch_waiting);
         /* Deleting the sycl queue wrapper and/or the command queue conflicts with the
          *   cleaning procedure of the Level Zero runtime... Didn't find a way to do it
          *   cleanly. Don't cleanup for now... */

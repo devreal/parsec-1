@@ -493,6 +493,7 @@ int __parsec_task_progress( parsec_execution_stream_t* es,
         case PARSEC_HOOK_RETURN_NEXT:    /* Try next variant [if any] */
         case PARSEC_HOOK_RETURN_DISABLE: /* Disable the device, something went wrong */
         case PARSEC_HOOK_RETURN_ERROR:   /* Some other major error happened */
+        case PARSEC_HOOK_RETURN_BATCH_WAIT: /* Only valid for GPU submit functions */
         default:
             parsec_fatal("Executing task of class %s failed with parsec_hook_return_t error %d", task->task_class->name, rc);
             /* we should not call fatal here, but the caller code

@@ -144,6 +144,10 @@ typedef enum parsec_hook_return_e {
     PARSEC_HOOK_RETURN_ASYNC   = -4,  /* The task is outside our reach, the completion will
                                        * be triggered asynchronously. */
     PARSEC_HOOK_RETURN_ERROR   = -5,  /* Some other major error happened */
+    PARSEC_HOOK_RETURN_BATCH_WAIT = -6,  /* Only valid from the submit function of a GPU task on
+                                          * an execution stream: park the batch head (and the
+                                          * followers it collected) until more tasks are ingested,
+                                          * see parsec_gpu_task_collect_batch(). */
 } parsec_hook_return_t;
 
 /* In order for the reshaping to work, retry codes should be negative
