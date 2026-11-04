@@ -17,7 +17,7 @@
 #include "parsec/class/list.h"
 #include "parsec/class/lifo.h"
 #include "parsec/class/parsec_heap.h"
-#include "parsec/class/parsec_obj_freelist.h"
+#include "parsec/mempool.h"
 #include "parsec/os-spec-timing.h"
 
 BEGIN_C_DECLS
@@ -299,7 +299,10 @@ struct parsec_device_gpu_module_s {
     parsec_binheap_t           pending_heap;  /**< manager-private max-heap for priority ordering */
     parsec_lifo_t              gpu_mem_inbox; /**< lock-free LIFO: other manager threads push here */
     struct zone_malloc_s      *memory;
-    parsec_obj_freelist_t      data_copy_freelist;  /**< data copies allocated by the device for its memory */
+    parsec_mempool_t           data_copy_mempool;   /**< data copies allocated by the device for its memory:
+                                                     *   a single thread mempool owned by the device (whichever
+                                                     *   thread manages it), grown in chunks, see
+                                                     *   PARSEC_DEVICE_DATA_COPY_ALLOCATOR */
     parsec_gpu_exec_stream_t **exec_stream;
     size_t                     mem_block_size;
     int64_t                    mem_nb_blocks;
@@ -529,6 +532,13 @@ int parsec_device_memory_release( parsec_device_gpu_module_t* gpu_device );
 /**
  * Release a gpu copy and return its memory to the zone allocator of the device.
  */
+/**
+ * The allocator for the data copies describing device memory: the device's
+ * data copy mempool has a single thread mempool, shared by all threads that
+ * allocate or release copies of the device.
+ */
+#define PARSEC_DEVICE_DATA_COPY_ALLOCATOR(gpu_device) (&(gpu_device)->data_copy_mempool.thread_mempools[0].super)
+
 void parsec_device_release_gpu_copy(parsec_device_gpu_module_t* gpu_device, parsec_data_copy_t *gpu_elem);
 
 /**

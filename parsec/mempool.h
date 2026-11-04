@@ -56,14 +56,19 @@ struct parsec_mempool_s {
     volatile uint32_t       nb_max_elt;         /**< this reflects the maximum of the nb_elt of the other threads */
     parsec_class_t          *obj_class;         /**< the base class of the objects inside the mempool */
     parsec_thread_mempool_t *thread_mempools;   /**< Array of thread mempools (of size nb_thread_mempools) */
+    unsigned int            elts_per_chunk;     /**< number of elements obtained by one allocation when a
+                                                 *   thread mempool runs empty (1: one malloc per element),
+                                                 *   see parsec_mempool_set_elts_per_chunk() */
 };
 
 struct parsec_thread_mempool_s {
     parsec_obj_allocator_t super; /**< allocator interface, must be first */
     parsec_mempool_t  *parent;   /**<  back pointer to the mempool */
-    uint32_t nb_elt;             /**< this is the number of elements this thread
+    volatile int32_t nb_elt;     /**< this is the number of elements this thread
                                   *   has allocated since the creation of the pool */
     parsec_lifo_t mempool;       /**< Elements are stored in a LIFO */
+    parsec_lifo_t chunks;        /**< blocks holding elts_per_chunk elements each (only used if
+                                  *   elts_per_chunk > 1), released when the mempool is destructed */
 };
 
 /**
@@ -265,6 +270,35 @@ static inline void  parsec_mempool_free( parsec_mempool_t *mempool, void *elt )
  * @return Number of elements (total) that were allocated in this mempool
  */
 uint64_t parsec_mempool_destruct( parsec_mempool_t *mempool );
+
+/**
+ * @brief destroy a mempool and report the elements still in use
+ *
+ * @details
+ *    Same as parsec_mempool_destruct(), but returns the number of elements
+ *    that had not been returned to the mempool. Their storage is released
+ *    nonetheless if it is part of a chunk (see parsec_mempool_set_elts_per_chunk()).
+ *
+ * @param[inout] mempool the mempool to destruct
+ * @return Number of elements allocated from the mempool that were not returned to it
+ */
+uint64_t parsec_mempool_destruct_in_use( parsec_mempool_t *mempool );
+
+/**
+ * @brief allocate elements in chunks when a thread mempool runs empty
+ *
+ * @details
+ *    By default, a thread mempool that runs empty allocates a single element.
+ *    With elts_per_chunk > 1, it instead obtains elts_per_chunk elements from
+ *    one allocation, each aligned to (and padded to a multiple of) a cache
+ *    line, so that objects used by different threads do not share a cache line.
+ *    Chunks are only released when the mempool is destructed. Must be called
+ *    before the first element is allocated from the mempool.
+ *
+ * @param[inout] mempool the mempool to configure
+ * @param[in] elts_per_chunk the number of elements per allocation (at least 1)
+ */
+void parsec_mempool_set_elts_per_chunk( parsec_mempool_t *mempool, unsigned int elts_per_chunk );
 
 /** @} */
 

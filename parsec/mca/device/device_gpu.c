@@ -22,6 +22,8 @@
 
 #define PARSEC_DEVICE_DATA_COPY_ATOMIC_SENTINEL 1024
 #define PARSEC_DEVICE_CLEAR_EVERY 128
+/* number of device data copies allocated at once when the device's data copy mempool is empty */
+#define PARSEC_DEVICE_DATA_COPY_CHUNK 128
 
 #if defined(PARSEC_PROF_TRACE)
 static int parsec_gpu_movein_key_start;
@@ -677,14 +679,18 @@ parsec_device_memory_reserve( parsec_device_gpu_module_t* gpu_device,
         return PARSEC_ERROR;
     }
 
-    /* the data copies describing the device memory are recycled through a device-local free-list */
-    if( NULL == gpu_device->data_copy_freelist.lifo ) {
-        rc = PARSEC_OBJ_FREELIST_CONSTRUCT(&gpu_device->data_copy_freelist, parsec_data_copy_t);
-        if(PARSEC_SUCCESS != rc) {
-            parsec_warning("GPU[%d:%s] Cannot allocate the free-list of data copies",
-                           gpu_device->super.device_index, gpu_device->super.name);
-            return rc;
-        }
+    /* The data copies describing the device memory are recycled through a mempool
+     * owned by the device. Device copies are kept in the LRU for reuse (and only released
+     * lazily once discarded), so their number grows with the data on the device: grow the
+     * mempool in chunks instead of one malloc per copy. The mempool has a single thread
+     * mempool, as copies are allocated by whichever thread manages the device and
+     * released by any thread. The back pointer to the thread mempool is stored past the
+     * end of the copy, where the copy's constructor does not overwrite it. */
+    if( NULL == gpu_device->data_copy_mempool.thread_mempools ) {
+        parsec_mempool_construct(&gpu_device->data_copy_mempool, PARSEC_OBJ_CLASS(parsec_data_copy_t),
+                                 sizeof(parsec_data_copy_t) + sizeof(parsec_thread_mempool_t*),
+                                 sizeof(parsec_data_copy_t), 1);
+        parsec_mempool_set_elts_per_chunk(&gpu_device->data_copy_mempool, PARSEC_DEVICE_DATA_COPY_CHUNK);
     }
 
 #if defined(PARSEC_GPU_ALLOC_PER_TILE)
@@ -706,7 +712,7 @@ parsec_device_memory_reserve( parsec_device_gpu_module_t* gpu_device,
                           gpu_device->super.device_index, gpu_device->super.name,_free_mem, _total_mem, mem_elem_per_gpu);
             break;
         }
-        gpu_elem = PARSEC_OBJ_NEW(parsec_data_copy_t, &gpu_device->data_copy_freelist.super);
+        gpu_elem = PARSEC_OBJ_NEW(parsec_data_copy_t, PARSEC_DEVICE_DATA_COPY_ALLOCATOR(gpu_device));
         PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                             "GPU[%d:%s] Allocate GPU copy %p [ref_count %d] for data [%p]",
                             gpu_device->super.device_index, gpu_device->super.name,gpu_elem, gpu_elem->super.obj_reference_count, NULL);
@@ -740,7 +746,7 @@ parsec_device_memory_reserve( parsec_device_gpu_module_t* gpu_device,
             parsec_warning("GPU[%d:%s] Allocating %zu bytes of memory on the GPU device failed (initial_free_mem was %zu)",
                            gpu_device->super.device_index, gpu_device->super.name, alloc_size, initial_free_mem);
             gpu_device->memory = NULL;
-            parsec_obj_freelist_destruct(&gpu_device->data_copy_freelist);
+            parsec_mempool_destruct(&gpu_device->data_copy_mempool);
             return PARSEC_ERROR;
         }
 
@@ -750,7 +756,7 @@ parsec_device_memory_reserve( parsec_device_gpu_module_t* gpu_device,
         if( gpu_device->memory == NULL ) {
             parsec_warning("GPU[%d:%s] Failed trying to allocate %zu bytes. We tried to do so based on an initial_free_mem of %zu bytes and elt_size of %zu bytes",
                            gpu_device->super.device_index, gpu_device->super.name, alloc_size, initial_free_mem, eltsize);
-            parsec_obj_freelist_destruct(&gpu_device->data_copy_freelist);
+            parsec_mempool_destruct(&gpu_device->data_copy_mempool);
             return PARSEC_ERROR;
         }
 
@@ -899,13 +905,13 @@ parsec_device_memory_release( parsec_device_gpu_module_t* gpu_device )
 
     parsec_device_flush_lru(&gpu_device->super);
 
-    if( NULL != gpu_device->data_copy_freelist.lifo ) {
+    if( NULL != gpu_device->data_copy_mempool.thread_mempools ) {
         /* All data copies allocated by the device must have been released by
-         * now: they keep the free-list as their allocator, and releasing one
+         * now: they keep the mempool as their allocator, and releasing one
          * once it is gone would fail far from the actual mistake. */
-        int32_t nb_in_use = parsec_obj_freelist_destruct(&gpu_device->data_copy_freelist);
+        uint64_t nb_in_use = parsec_mempool_destruct_in_use(&gpu_device->data_copy_mempool);
         if( 0 != nb_in_use ) {
-            parsec_fatal("GPU[%d:%s]: %d data copies allocated by the device are still in use",
+            parsec_fatal("GPU[%d:%s]: %" PRIu64 " data copies allocated by the device are still in use",
                          gpu_device->super.device_index, gpu_device->super.name, nb_in_use);
         }
     }
@@ -1098,7 +1104,7 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
         }
 
 #if !defined(PARSEC_GPU_ALLOC_PER_TILE)
-        gpu_elem = PARSEC_OBJ_NEW(parsec_data_copy_t, &gpu_device->data_copy_freelist.super);
+        gpu_elem = PARSEC_OBJ_NEW(parsec_data_copy_t, PARSEC_DEVICE_DATA_COPY_ALLOCATOR(gpu_device));
         PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
                              "GPU[%d:%s]:%s: Allocate GPU copy %p sz %zu [ref_count %d] for data %p",
                              gpu_device->super.device_index, gpu_device->super.name, task_name,
