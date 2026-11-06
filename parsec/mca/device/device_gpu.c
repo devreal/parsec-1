@@ -1118,7 +1118,12 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
             gpu_elem->device_private = prealloc[i];
             prealloc[i] = NULL;
         } else {
-            gpu_elem->device_private = zone_malloc(gpu_device->memory, gpu_task->flow_nb_elts[i]);
+            /* zone_malloc() returns NULL for a size of 0, which would be taken for a lack of
+             * memory: allocate the smallest unit instead, a data of size 0 (e.g., an empty
+             * buffer) would otherwise only find room by repurposing a copy of the LRU, and
+             * never once the LRU is empty */
+            gpu_elem->device_private = zone_malloc(gpu_device->memory,
+                                                   gpu_task->flow_nb_elts[i] > 0 ? gpu_task->flow_nb_elts[i] : 1);
         }
         if( NULL == gpu_elem->device_private ) {
 #endif
@@ -1427,6 +1432,7 @@ parsec_default_gpu_stage_in_collect(parsec_gpu_task_t                  *gtask,
 
         count = (source->original->nb_elts <= dest->original->nb_elts) ?
             source->original->nb_elts : dest->original->nb_elts;
+        if( 0 == count ) continue;  /* nothing to copy, and batched copies reject empty items */
         dsts[n]       = dest->device_private;
         srcs[n]       = source->device_private;
         sizes[n]      = count;
@@ -1506,6 +1512,7 @@ parsec_default_gpu_stage_out_collect(parsec_gpu_task_t                  *gtask,
 
             count = (source->original->nb_elts <= dest->original->nb_elts) ? source->original->nb_elts :
                         dest->original->nb_elts;
+            if( 0 == count ) continue;  /* nothing to copy (and no host buffer to allocate) */
             if( (src_dev->super.type & PARSEC_DEV_ANY_TYPE) == (dst_dev->super.type & PARSEC_DEV_ANY_TYPE) ) {
                 assert( src_dev->peer_access_mask & (1 << dst_dev->super.device_index) );
                 dir = parsec_device_gpu_transfer_direction_d2d;
@@ -3101,10 +3108,16 @@ parsec_device_kernel_push_task( parsec_device_gpu_module_t      *gpu_device,
         }
     }
 
-    /* Do we have enough available memory on the GPU to hold the input and output data ? */
+    /* Do we have enough available memory on the GPU to hold the input and output data ?
+     * Read the epoch before trying: memory released by other threads while we try
+     * (e.g., discarded data, see parsec_data_discard()) advances the epoch, and must make
+     * the next attempt go through. Reading the epoch after the failed attempt would mark
+     * such a release as already seen, and if nothing else is released afterwards the task
+     * would never be tried again. */
+    const uint64_t epoch_before = gpu_device->data_avail_epoch;
     ret = parsec_device_data_reserve_space( gpu_device, gpu_task );
     if( ret < 0 ) {
-        gpu_task->last_data_check_epoch = gpu_device->data_avail_epoch;
+        gpu_task->last_data_check_epoch = epoch_before;
         return ret;
     }
 
