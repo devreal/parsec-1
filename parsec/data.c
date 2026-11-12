@@ -325,17 +325,10 @@ void parsec_data_end_transfer_ownership_to_copy(parsec_data_t* data,
     if( (PARSEC_FLOW_ACCESS_READ & access_mode) &&
         (0 == (PARSEC_FLOW_ACCESS_WRITE & access_mode)) &&
         copy->data_transfer_status == PARSEC_DATA_STATUS_UNDER_TRANSFER ) {
-        /* if a copy was a previously EXCLUSIVE or OWNED it is now shared */
-        for( uint32_t i = 0; i < parsec_nb_devices; i++ ) {
-            if (NULL == data->device_copies[i]) continue;
-            if (data->device_copies[i]->coherency_state == PARSEC_DATA_COHERENCY_OWNED) {
-                data->device_copies[i]->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
-            }
-            if (data->owner_device == (int)i) {
-                // there is no owner device anymore
-                data->owner_device = -1;
-            }
-        }
+        /* The new copy is a clean reader. An OWNED copy elsewhere stays OWNED (and the
+         * owner_device unchanged): being read does not write it back, so it remains the
+         * only copy that must be saved before it is evicted. Demoting it to SHARED would
+         * let its device drop it without a write-back once the readers are gone. */
         copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
     }
 

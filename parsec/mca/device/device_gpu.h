@@ -110,6 +110,9 @@ struct parsec_gpu_task_s {
     uint64_t                               heap_seq; /**< FIFO tie-break stamp, set by parsec_heap_push(); see pending_heap */
     uint16_t                               task_type;
     uint32_t                               pushout;
+    uint32_t                               staged_in; /**< mask of the flows whose stage-in already started during
+                                                       *   an earlier, incomplete, push attempt of the task, so the
+                                                       *   retries don't start the transfer of ownership again */
     int32_t                                last_status;
     const void                            *batch_key; /**< identifies the batch group of the task: tasks with the
                                                        *   same non-NULL key move together through the device

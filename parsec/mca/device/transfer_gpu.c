@@ -266,6 +266,20 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
             parsec_atomic_unlock( &gpu_copy->original->lock );
             parsec_device_release_gpu_copy(gpu_device, gpu_copy);
             nb_discarded++;
+        } else if( PARSEC_DATA_COHERENCY_INVALID == gpu_copy->coherency_state ) {
+            /* A newer version was written elsewhere (e.g., this OWNED copy was read by
+             * another device, and then overwritten there): this copy is stale, and must
+             * not be written back. Let it be dropped through the read-only LRU instead. */
+            if( 0 == gpu_copy->readers &&
+                PARSEC_DATA_STATUS_UNDER_TRANSFER != gpu_copy->data_transfer_status ) {
+                parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
+                PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
+                PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
+                                     "D2H[%d:%s] GPU data copy %p [%p] is invalid, moved to the read-only LRU",
+                                     gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->original);
+                parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
+            }
+            parsec_atomic_unlock( &gpu_copy->original->lock );
         } else if( 0 == gpu_copy->readers ) {
             if( PARSEC_UNLIKELY(NULL == d2h_task) ) {  /* allocate on-demand */
                 d2h_task = (parsec_gpu_d2h_task_t*)parsec_thread_mempool_allocate(es->context_mempool);
