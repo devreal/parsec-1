@@ -44,7 +44,15 @@ int parsec_gpu_output_stream = -1;
 int parsec_gpu_verbosity;
 int32_t parsec_gpu_exec_delay_batch = 1;
 
-static thread_local int active_w2r_tasks = 0;
+/* Number of eviction (w2r) tasks in flight, per device (indexed by the device index, which
+ * fits in a uint8_t): evictions are throttled to one at a time per device. It must be per
+ * device, not per thread: the manager of a device is whichever thread holds its mutex, so a
+ * w2r task created by one manager may complete under another. With a thread-local counter the
+ * creating thread kept a count of 1 forever and the completing thread went negative, so
+ * neither ever started another eviction: under memory pressure the owned LRU was never
+ * written back and the device stalled with a full pool. Only the manager (holding the device
+ * mutex) touches it. */
+static int active_w2r_tasks[256] = {0};
 
 
 /**
@@ -4081,11 +4089,11 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
          * Executing tasks release memory once they complete, so delay the eviction
          * while the next execution stream still has work, and start pushing data out
          * as soon as it runs dry. */
-        if ((active_w2r_tasks == 0) &&
+        if ((active_w2r_tasks[gpu_device->super.device_index] == 0) &&
             !parsec_device_stream_has_tasks(gpu_device->exec_stream[2 + (exec_stream + 1) % (gpu_device->num_exec_streams - 2)])) {
             gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
             if( NULL != gpu_task ) {
-                active_w2r_tasks++;
+                active_w2r_tasks[gpu_device->super.device_index]++;
                 goto get_data_out_of_device;
             }
         }
@@ -4218,7 +4226,8 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                              parsec_task_snprintf(tmp, MAX_TASK_STRLEN, task));
         if (iter->task_type == PARSEC_GPU_TASK_TYPE_D2HTRANSFER) {
             parsec_gpu_complete_w2r_task(gpu_device, iter, es);
-            active_w2r_tasks--;
+            active_w2r_tasks[gpu_device->super.device_index]--;
+            assert(active_w2r_tasks[gpu_device->super.device_index] >= 0);
             /* d2h transfers are not accounted for in the device mutex */
         } else {
             bool d2d_complete = (iter->task_type == PARSEC_GPU_TASK_TYPE_D2D_COMPLETE);
