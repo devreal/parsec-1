@@ -871,8 +871,24 @@ parsec_device_flush_lru( parsec_device_module_t *device )
     size_t in_use;
     parsec_device_gpu_module_t *gpu_device = (parsec_device_gpu_module_t*)device;
     /* Free all remaining memory on GPU */
+#if !defined(NDEBUG)
+    int64_t discarded_before = gpu_device->super.nb_discarded;
+    size_t lru_len = 0, owned_len = 0;
+    PARSEC_LIST_ITERATOR(&gpu_device->gpu_mem_lru, it, { (void)it; lru_len++; });
+    PARSEC_LIST_ITERATOR(&gpu_device->gpu_mem_owned_lru, it, { (void)it; owned_len++; });
+#endif
     parsec_device_memory_release_list(gpu_device, &gpu_device->gpu_mem_lru);
+#if !defined(NDEBUG)
+    int64_t discarded_mid = gpu_device->super.nb_discarded;
+#endif
     parsec_device_memory_release_list(gpu_device, &gpu_device->gpu_mem_owned_lru);
+#if !defined(NDEBUG)
+    if (gpu_device->super.nb_discarded != 0) {
+        parsec_warning("GPU[%d:%s] flush_lru: nb_discarded %" PRId64 " before flush, %" PRId64 " after the read LRU (%zu items), %" PRId64 " after the owned LRU (%zu items)",
+                       gpu_device->super.device_index, gpu_device->super.name, discarded_before, discarded_mid,
+                       lru_len, gpu_device->super.nb_discarded, owned_len);
+    }
+#endif
     assert(gpu_device->super.nb_discarded == 0);
     parsec_device_free_workspace(gpu_device);
 #if !defined(PARSEC_GPU_ALLOC_PER_TILE) && !defined(_NDEBUG)
@@ -1166,13 +1182,10 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                 parsec_device_data_prealloc_release(gpu_device, prealloc, this_task->task_class->nb_flows);
 #endif
                 return PARSEC_HOOK_RETURN_NEXT;
-            } else if (NULL != lru_gpu_elem->original) {
-                /* account for discarded data */
-                parsec_data_copy_t* cpu_copy = lru_gpu_elem->original->device_copies[0];
-                if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) {
-                    parsec_atomic_fetch_dec_int64(&gpu_device->super.nb_discarded);
-                }
             }
+            /* A copy of discarded data is accounted for (nb_discarded) only once it is
+             * detached for reuse below: until then it may still go back to an LRU (cycle,
+             * readers, refcount), from where it is accounted for when it is released. */
 
             PARSEC_LIST_ITEM_SINGLETON(lru_gpu_elem);
             PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
@@ -1280,7 +1293,10 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                  * If there is none, this copy is the only one with the data (e.g., an owned copy that
                  * became shared when another device read it): move it to the owned LRU instead, from
                  * where it is written back to the host before it is evicted. */
-                {
+                /* Discarded data needs no write-back: its copy can always be reused. */
+                const int oldmaster_discarded = (NULL != oldmaster->device_copies[0]) &&
+                                                (oldmaster->device_copies[0]->flags & PARSEC_DATA_FLAG_DISCARDED);
+                if( !oldmaster_discarded ) {
                     int other_copy = 0;
                     for( int t = 0; t < (int)parsec_nb_devices && !other_copy; t++ ) {
                         parsec_data_copy_t *c = oldmaster->device_copies[t];
@@ -1309,6 +1325,10 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                 /* detach could have released the oldmaster if it only had a single refcount */
                 if( do_unlock )
                     parsec_atomic_unlock( &oldmaster->lock );
+                if( oldmaster_discarded ) {
+                    /* the copy of discarded data is reused: account for it (see above) */
+                    parsec_atomic_fetch_dec_int64(&gpu_device->super.nb_discarded);
+                }
 
                 /* The data is not used, it's not one of ours, and it has been detached from the device
                  * so no other device can use it as a source for their copy : we can free it or reuse it */
