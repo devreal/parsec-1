@@ -3213,6 +3213,7 @@ parsec_device_kernel_push_task( parsec_device_gpu_module_t      *gpu_device,
         }
         assert(i < (int)(sizeof(gpu_task->staged_in)*8));
         gpu_task->staged_in |= (1U << i);
+        if( flow->flow_flags & PARSEC_FLOW_ACCESS_READ ) gpu_task->reader_held |= (1U << i);
         how_many += ret;
     }
     gpu_task->staged_in = 0;
@@ -3496,6 +3497,44 @@ parsec_device_kernel_pop_task( parsec_device_gpu_module_t   *gpu_device,
 #endif // 0
 
         parsec_atomic_lock(&original->lock);
+        if( !(flow->flow_flags & PARSEC_FLOW_ACCESS_WRITE) && (gpu_task->pushout & (1U << i)) ) {
+            /* Pushout of data the task only read: copy it to the host without taking
+             * ownership. The task keeps its reader on the device copy until the epilog,
+             * so the copy is not evicted or repurposed while the transfer reads it, and
+             * concurrent readers of the copy are not disturbed. No transfer is needed if
+             * the host copy is already current. */
+            parsec_data_copy_t *cpu_copy = original->device_copies[0];
+            const int held = (0 != (gpu_task->reader_held & (1U << i)));
+            if( (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) ||
+                ((NULL != cpu_copy->device_private) && (cpu_copy->version == gpu_copy->version)) ) {
+                gpu_task->pushout &= ~(1U << i);
+                if( !held ) {
+                    /* added after the push: never staged in, no reader to release */
+                    this_task->data[i].data_out = cpu_copy;
+                    parsec_atomic_unlock(&original->lock);
+                    continue;
+                }
+                /* else handled below as a plain read */
+            } else {
+                if( !held ) {
+                    /* added after the push: take the reader the transfer needs now. As
+                     * for the write pushout this replaces, the copy is assumed to be the
+                     * current one on this device (data_out was set when the flow was added). */
+                    parsec_atomic_fetch_inc_int32(&gpu_copy->readers);
+                }
+                PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
+                                     "GPU[%d:%s]:\tMove D2H read-only data <%s:%x> copy %p [ref_count %d, readers %d] requested",
+                                     gpu_device->super.device_index, gpu_device->super.name, flow->name, original->key,
+                                     gpu_copy, gpu_copy->super.super.obj_reference_count, gpu_copy->readers);
+                gpu_device->super.required_data_out += nb_elts;
+                assert(flow->flow_index < (sizeof(*transfer_mask)*8));
+                *transfer_mask |= (1U << flow->flow_index);
+                pending_bytes += nb_elts;
+                nb_pushout++;
+                parsec_atomic_unlock(&original->lock);
+                continue;
+            }
+        }
         if( flow->flow_flags & PARSEC_FLOW_ACCESS_READ ) {
             int current_readers = parsec_atomic_fetch_sub_int32(&gpu_copy->readers, 1) - 1;
             if( current_readers < 0 ) {
@@ -3597,6 +3636,7 @@ parsec_device_kernel_pop_task( parsec_device_gpu_module_t   *gpu_device,
         how_many += nb_pushout;
     }
 
+    gpu_task->reader_held = 0;  /* released above, or held by a read-only pushout until the epilog */
     if( update_data_epoch ) {
         gpu_device->data_avail_epoch++;
     }
@@ -3671,7 +3711,39 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
 
 
         if( !(gpu_task->flow[i]->flow_flags & PARSEC_FLOW_ACCESS_WRITE) ) {
-            /* Warning data_out for read only flows has been overwritten in pop */
+            if( gpu_task->pushout & (1U << i) ) {
+                /* read-only pushout (see pop): the host copy now holds the device data.
+                 * Both copies are valid; release the reader held since the pop. */
+                gpu_copy = this_task->data[i].data_out;
+                original = gpu_copy->original;
+                cpu_copy = original->device_copies[0];
+                parsec_atomic_lock(&original->lock);
+                cpu_copy->version = gpu_copy->version;
+                cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
+                gpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
+                this_task->data[i].data_out = cpu_copy;  /* as pop does for read-only flows */
+                int current_readers = parsec_atomic_fetch_sub_int32(&gpu_copy->readers, 1) - 1;
+                assert(current_readers >= 0);
+                /* the copy is SHARED now: (re)list it on the read LRU, as the write pushout
+                 * did, even if others still read it (eviction skips copies with readers).
+                 * It must not be left unlisted: not every reader is released by a pop that
+                 * would list it again (e.g., TTG's remote sends hold readers until the
+                 * transfer completes), and an unlisted copy is never released, which also
+                 * leaves a discarded copy uncounted (nb_discarded). It may sit on the owned
+                 * LRU, put there by another reader's pop while it was OWNED. */
+                parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
+                PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
+                parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
+                if( 0 == current_readers ) {
+                    gpu_device->data_avail_epoch++;
+                }
+                parsec_atomic_unlock(&original->lock);
+                PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
+                                     "GPU[%d:%s]: read-only pushout of copy %p [ref_count %d] done, readers %d",
+                                     gpu_device->super.device_index, gpu_device->super.name,
+                                     gpu_copy, gpu_copy->super.super.obj_reference_count, current_readers);
+            }
+            /* otherwise data_out for read only flows has been overwritten in pop */
             continue;
         }
 

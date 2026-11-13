@@ -113,6 +113,10 @@ struct parsec_gpu_task_s {
     uint32_t                               staged_in; /**< mask of the flows whose stage-in already started during
                                                        *   an earlier, incomplete, push attempt of the task, so the
                                                        *   retries don't start the transfer of ownership again */
+    uint32_t                               reader_held; /**< mask of the read flows whose stage-in counted the task as a
+                                                         *   reader of the device copy; consumed by the pop. Flows added
+                                                         *   after the push (e.g., a pushout requested when the task
+                                                         *   sends its data) were not staged in and hold no reader. */
     int32_t                                last_status;
     const void                            *batch_key; /**< identifies the batch group of the task: tasks with the
                                                        *   same non-NULL key move together through the device
