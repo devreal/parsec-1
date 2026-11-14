@@ -44,7 +44,15 @@ int parsec_gpu_output_stream = -1;
 int parsec_gpu_verbosity;
 int32_t parsec_gpu_exec_delay_batch = 1;
 
-static thread_local int active_w2r_tasks = 0;
+/* Number of eviction (w2r) tasks in flight, per device (indexed by the device index, which
+ * fits in a uint8_t): evictions are throttled to one at a time per device. It must be per
+ * device, not per thread: the manager of a device is whichever thread holds its mutex, so a
+ * w2r task created by one manager may complete under another. With a thread-local counter the
+ * creating thread kept a count of 1 forever and the completing thread went negative, so
+ * neither ever started another eviction: under memory pressure the owned LRU was never
+ * written back and the device stalled with a full pool. Only the manager (holding the device
+ * mutex) touches it. */
+static int active_w2r_tasks[256] = {0};
 
 
 /**
@@ -871,8 +879,24 @@ parsec_device_flush_lru( parsec_device_module_t *device )
     size_t in_use;
     parsec_device_gpu_module_t *gpu_device = (parsec_device_gpu_module_t*)device;
     /* Free all remaining memory on GPU */
+#if !defined(NDEBUG)
+    int64_t discarded_before = gpu_device->super.nb_discarded;
+    size_t lru_len = 0, owned_len = 0;
+    PARSEC_LIST_ITERATOR(&gpu_device->gpu_mem_lru, it, { (void)it; lru_len++; });
+    PARSEC_LIST_ITERATOR(&gpu_device->gpu_mem_owned_lru, it, { (void)it; owned_len++; });
+#endif
     parsec_device_memory_release_list(gpu_device, &gpu_device->gpu_mem_lru);
+#if !defined(NDEBUG)
+    int64_t discarded_mid = gpu_device->super.nb_discarded;
+#endif
     parsec_device_memory_release_list(gpu_device, &gpu_device->gpu_mem_owned_lru);
+#if !defined(NDEBUG)
+    if (gpu_device->super.nb_discarded != 0) {
+        parsec_warning("GPU[%d:%s] flush_lru: nb_discarded %" PRId64 " before flush, %" PRId64 " after the read LRU (%zu items), %" PRId64 " after the owned LRU (%zu items)",
+                       gpu_device->super.device_index, gpu_device->super.name, discarded_before, discarded_mid,
+                       lru_len, gpu_device->super.nb_discarded, owned_len);
+    }
+#endif
     assert(gpu_device->super.nb_discarded == 0);
     parsec_device_free_workspace(gpu_device);
 #if !defined(PARSEC_GPU_ALLOC_PER_TILE) && !defined(_NDEBUG)
@@ -1166,13 +1190,10 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                 parsec_device_data_prealloc_release(gpu_device, prealloc, this_task->task_class->nb_flows);
 #endif
                 return PARSEC_HOOK_RETURN_NEXT;
-            } else if (NULL != lru_gpu_elem->original) {
-                /* account for discarded data */
-                parsec_data_copy_t* cpu_copy = lru_gpu_elem->original->device_copies[0];
-                if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) {
-                    parsec_atomic_fetch_dec_int64(&gpu_device->super.nb_discarded);
-                }
             }
+            /* A copy of discarded data is accounted for (nb_discarded) only once it is
+             * detached for reuse below: until then it may still go back to an LRU (cycle,
+             * readers, refcount), from where it is accounted for when it is released. */
 
             PARSEC_LIST_ITEM_SINGLETON(lru_gpu_elem);
             PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
@@ -1280,7 +1301,10 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                  * If there is none, this copy is the only one with the data (e.g., an owned copy that
                  * became shared when another device read it): move it to the owned LRU instead, from
                  * where it is written back to the host before it is evicted. */
-                {
+                /* Discarded data needs no write-back: its copy can always be reused. */
+                const int oldmaster_discarded = (NULL != oldmaster->device_copies[0]) &&
+                                                (oldmaster->device_copies[0]->flags & PARSEC_DATA_FLAG_DISCARDED);
+                if( !oldmaster_discarded ) {
                     int other_copy = 0;
                     for( int t = 0; t < (int)parsec_nb_devices && !other_copy; t++ ) {
                         parsec_data_copy_t *c = oldmaster->device_copies[t];
@@ -1309,6 +1333,10 @@ parsec_device_data_reserve_space( parsec_device_gpu_module_t* gpu_device,
                 /* detach could have released the oldmaster if it only had a single refcount */
                 if( do_unlock )
                     parsec_atomic_unlock( &oldmaster->lock );
+                if( oldmaster_discarded ) {
+                    /* the copy of discarded data is reused: account for it (see above) */
+                    parsec_atomic_fetch_dec_int64(&gpu_device->super.nb_discarded);
+                }
 
                 /* The data is not used, it's not one of ours, and it has been detached from the device
                  * so no other device can use it as a source for their copy : we can free it or reuse it */
@@ -3213,6 +3241,7 @@ parsec_device_kernel_push_task( parsec_device_gpu_module_t      *gpu_device,
         }
         assert(i < (int)(sizeof(gpu_task->staged_in)*8));
         gpu_task->staged_in |= (1U << i);
+        if( flow->flow_flags & PARSEC_FLOW_ACCESS_READ ) gpu_task->reader_held |= (1U << i);
         how_many += ret;
     }
     gpu_task->staged_in = 0;
@@ -3496,6 +3525,44 @@ parsec_device_kernel_pop_task( parsec_device_gpu_module_t   *gpu_device,
 #endif // 0
 
         parsec_atomic_lock(&original->lock);
+        if( !(flow->flow_flags & PARSEC_FLOW_ACCESS_WRITE) && (gpu_task->pushout & (1U << i)) ) {
+            /* Pushout of data the task only read: copy it to the host without taking
+             * ownership. The task keeps its reader on the device copy until the epilog,
+             * so the copy is not evicted or repurposed while the transfer reads it, and
+             * concurrent readers of the copy are not disturbed. No transfer is needed if
+             * the host copy is already current. */
+            parsec_data_copy_t *cpu_copy = original->device_copies[0];
+            const int held = (0 != (gpu_task->reader_held & (1U << i)));
+            if( (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) ||
+                ((NULL != cpu_copy->device_private) && (cpu_copy->version == gpu_copy->version)) ) {
+                gpu_task->pushout &= ~(1U << i);
+                if( !held ) {
+                    /* added after the push: never staged in, no reader to release */
+                    this_task->data[i].data_out = cpu_copy;
+                    parsec_atomic_unlock(&original->lock);
+                    continue;
+                }
+                /* else handled below as a plain read */
+            } else {
+                if( !held ) {
+                    /* added after the push: take the reader the transfer needs now. As
+                     * for the write pushout this replaces, the copy is assumed to be the
+                     * current one on this device (data_out was set when the flow was added). */
+                    parsec_atomic_fetch_inc_int32(&gpu_copy->readers);
+                }
+                PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
+                                     "GPU[%d:%s]:\tMove D2H read-only data <%s:%x> copy %p [ref_count %d, readers %d] requested",
+                                     gpu_device->super.device_index, gpu_device->super.name, flow->name, original->key,
+                                     gpu_copy, gpu_copy->super.super.obj_reference_count, gpu_copy->readers);
+                gpu_device->super.required_data_out += nb_elts;
+                assert(flow->flow_index < (sizeof(*transfer_mask)*8));
+                *transfer_mask |= (1U << flow->flow_index);
+                pending_bytes += nb_elts;
+                nb_pushout++;
+                parsec_atomic_unlock(&original->lock);
+                continue;
+            }
+        }
         if( flow->flow_flags & PARSEC_FLOW_ACCESS_READ ) {
             int current_readers = parsec_atomic_fetch_sub_int32(&gpu_copy->readers, 1) - 1;
             if( current_readers < 0 ) {
@@ -3597,6 +3664,7 @@ parsec_device_kernel_pop_task( parsec_device_gpu_module_t   *gpu_device,
         how_many += nb_pushout;
     }
 
+    gpu_task->reader_held = 0;  /* released above, or held by a read-only pushout until the epilog */
     if( update_data_epoch ) {
         gpu_device->data_avail_epoch++;
     }
@@ -3671,7 +3739,39 @@ parsec_device_kernel_epilog( parsec_device_gpu_module_t *gpu_device,
 
 
         if( !(gpu_task->flow[i]->flow_flags & PARSEC_FLOW_ACCESS_WRITE) ) {
-            /* Warning data_out for read only flows has been overwritten in pop */
+            if( gpu_task->pushout & (1U << i) ) {
+                /* read-only pushout (see pop): the host copy now holds the device data.
+                 * Both copies are valid; release the reader held since the pop. */
+                gpu_copy = this_task->data[i].data_out;
+                original = gpu_copy->original;
+                cpu_copy = original->device_copies[0];
+                parsec_atomic_lock(&original->lock);
+                cpu_copy->version = gpu_copy->version;
+                cpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
+                gpu_copy->coherency_state = PARSEC_DATA_COHERENCY_SHARED;
+                this_task->data[i].data_out = cpu_copy;  /* as pop does for read-only flows */
+                int current_readers = parsec_atomic_fetch_sub_int32(&gpu_copy->readers, 1) - 1;
+                assert(current_readers >= 0);
+                /* the copy is SHARED now: (re)list it on the read LRU, as the write pushout
+                 * did, even if others still read it (eviction skips copies with readers).
+                 * It must not be left unlisted: not every reader is released by a pop that
+                 * would list it again (e.g., TTG's remote sends hold readers until the
+                 * transfer completes), and an unlisted copy is never released, which also
+                 * leaves a discarded copy uncounted (nb_discarded). It may sit on the owned
+                 * LRU, put there by another reader's pop while it was OWNED. */
+                parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
+                PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
+                parsec_list_nolock_push_back(&gpu_device->gpu_mem_lru, (parsec_list_item_t*)gpu_copy);
+                if( 0 == current_readers ) {
+                    gpu_device->data_avail_epoch++;
+                }
+                parsec_atomic_unlock(&original->lock);
+                PARSEC_DEBUG_VERBOSE(20, parsec_gpu_output_stream,
+                                     "GPU[%d:%s]: read-only pushout of copy %p [ref_count %d] done, readers %d",
+                                     gpu_device->super.device_index, gpu_device->super.name,
+                                     gpu_copy, gpu_copy->super.super.obj_reference_count, current_readers);
+            }
+            /* otherwise data_out for read only flows has been overwritten in pop */
             continue;
         }
 
@@ -3989,11 +4089,11 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
          * Executing tasks release memory once they complete, so delay the eviction
          * while the next execution stream still has work, and start pushing data out
          * as soon as it runs dry. */
-        if ((active_w2r_tasks == 0) &&
+        if ((active_w2r_tasks[gpu_device->super.device_index] == 0) &&
             !parsec_device_stream_has_tasks(gpu_device->exec_stream[2 + (exec_stream + 1) % (gpu_device->num_exec_streams - 2)])) {
             gpu_task = parsec_gpu_create_w2r_task(gpu_device, es);
             if( NULL != gpu_task ) {
-                active_w2r_tasks++;
+                active_w2r_tasks[gpu_device->super.device_index]++;
                 goto get_data_out_of_device;
             }
         }
@@ -4126,7 +4226,8 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
                              parsec_task_snprintf(tmp, MAX_TASK_STRLEN, task));
         if (iter->task_type == PARSEC_GPU_TASK_TYPE_D2HTRANSFER) {
             parsec_gpu_complete_w2r_task(gpu_device, iter, es);
-            active_w2r_tasks--;
+            active_w2r_tasks[gpu_device->super.device_index]--;
+            assert(active_w2r_tasks[gpu_device->super.device_index] >= 0);
             /* d2h transfers are not accounted for in the device mutex */
         } else {
             bool d2d_complete = (iter->task_type == PARSEC_GPU_TASK_TYPE_D2D_COMPLETE);
