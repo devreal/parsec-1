@@ -300,6 +300,10 @@ struct parsec_device_gpu_module_s {
                                                    *   is increased every time a new data is made available, so
                                                    *   that we know which tasks can be evaluated for submission.
                                                    */
+    uint64_t                   w2r_empty_epoch;     /**< data_avail_epoch when the last eviction scan found
+                                                     *   nothing to evict or release (UINT64_MAX: none) */
+    int64_t                    w2r_empty_discarded; /**< nb_discarded at that scan */
+    int32_t                    w2r_skipped;         /**< scans skipped since, see parsec_gpu_create_w2r_task */
     parsec_list_t              gpu_mem_lru;   /* Read-only blocks, and fresh blocks */
     parsec_list_t              gpu_mem_owned_lru;  /* Dirty blocks */
     parsec_lifo_t              pending;       /**< lock-free LIFO: CPU threads push here */

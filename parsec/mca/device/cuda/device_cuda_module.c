@@ -509,6 +509,9 @@ parsec_cuda_module_init( int dev_id, parsec_device_module_t** module )
     len = asprintf(&gpu_device->super.name, "cuda(%d)", dev_id);
     if(-1 == len) { gpu_device->super.name = NULL; goto release_device; }
     gpu_device->data_avail_epoch = 0;
+    gpu_device->w2r_empty_epoch = UINT64_MAX;
+    gpu_device->w2r_empty_discarded = 0;
+    gpu_device->w2r_skipped = 0;
 
     gpu_device->max_exec_streams = parsec_cuda_max_streams;
     gpu_device->exec_stream =

@@ -229,6 +229,9 @@ static inline void release_discarded_data(parsec_device_gpu_module_t *gpu_device
 
 }
 
+/* how many passes parsec_gpu_create_w2r_task skips its scan at most while nothing changed */
+#define PARSEC_GPU_W2R_RESCAN_EVERY 64
+
 /**
  * Transfer at most the MAX_PARAM_COUNT oldest data from the GPU back
  * to main memory. Create a single task to move them all out, then switch the
@@ -245,6 +248,21 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
     int nb_cleaned = 0;
     int nb_discarded = 0;
 
+    /* The scheduler calls this on every pass while a task waits for memory, and the scan
+     * walks the whole owned LRU when nothing can be evicted (every copy in use). Skip it
+     * while nothing changed since a scan that found nothing: no memory was released or
+     * made available (data_avail_epoch) and no data was discarded (nb_discarded). Not
+     * every change is reflected there (e.g., a reader released by another thread), so
+     * scan anyway every so often. */
+    const uint64_t epoch = gpu_device->data_avail_epoch;
+    const int64_t discarded = gpu_device->super.nb_discarded;
+    if( epoch == gpu_device->w2r_empty_epoch && discarded == gpu_device->w2r_empty_discarded &&
+        ++gpu_device->w2r_skipped < PARSEC_GPU_W2R_RESCAN_EVERY ) {
+        return NULL;
+    }
+    gpu_device->w2r_skipped = 0;
+    gpu_device->w2r_empty_epoch = UINT64_MAX;
+
     /* Find a data copy that has no pending users on the GPU, and can be
      * safely moved back on the main memory */
     while(nb_cleaned < parsec_gpu_d2h_max_flows) {
@@ -254,18 +272,30 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
         }
         gpu_copy = (parsec_gpu_data_copy_t*)item;
         cpu_copy = gpu_copy->original->device_copies[0];
-        parsec_atomic_lock( &gpu_copy->original->lock );
-        /* get the next item before altering the next pointer */
+        /* get the next item before altering the next pointer (the LRU belongs to the
+         * manager, other threads do not change it) */
         item = (parsec_list_item_t*)item->list_next;  /* conversion needed for volatile */
         if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) {
+            /* discarded data has no other users: release it without taking its lock
+             * (parsec_device_release_gpu_copy locks it to free the memory) */
             parsec_list_item_ring_chop((parsec_list_item_t*)gpu_copy);
             PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
             PARSEC_DEBUG_VERBOSE(10, parsec_gpu_output_stream,
                                  "D2H[%d:%s] GPU data copy %p of discarded data %p will be released",
                                  gpu_device->super.device_index, gpu_device->super.name, gpu_copy, gpu_copy->original);
-            parsec_atomic_unlock( &gpu_copy->original->lock );
             parsec_device_release_gpu_copy(gpu_device, gpu_copy);
             nb_discarded++;
+            continue;
+        }
+        if( 0 != gpu_copy->readers ) {
+            /* in use, nothing to do for it (as below, under the lock): skip it without
+             * taking its lock. A stale read only defers it to the next scan. */
+            continue;
+        }
+        parsec_atomic_lock( &gpu_copy->original->lock );
+        if (cpu_copy->flags & PARSEC_DATA_FLAG_DISCARDED) {
+            /* discarded since the check above: leave it to the next scan */
+            parsec_atomic_unlock( &gpu_copy->original->lock );
         } else if( PARSEC_DATA_COHERENCY_INVALID == gpu_copy->coherency_state ) {
             /* A newer version was written elsewhere (e.g., this OWNED copy was read by
              * another device, and then overwritten there): this copy is stale, and must
@@ -311,8 +341,14 @@ parsec_gpu_create_w2r_task(parsec_device_gpu_module_t *gpu_device,
         parsec_atomic_fetch_sub_int64(&gpu_device->super.nb_discarded, nb_discarded);
     }
 
-    if( 0 == nb_cleaned )
+    if( 0 == nb_cleaned ) {
+        if( 0 == nb_discarded ) {
+            /* nothing to do: skip the next scans until something changes */
+            gpu_device->w2r_empty_epoch = epoch;
+            gpu_device->w2r_empty_discarded = discarded;
+        }
         return NULL;
+    }
 
     d2h_task->priority        = INT32_MAX;
     d2h_task->task_class      = &parsec_gpu_d2h_task_class;

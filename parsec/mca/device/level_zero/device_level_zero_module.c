@@ -243,6 +243,9 @@ int parsec_level_zero_module_init( int dev_id, parsec_device_level_zero_driver_t
         goto release_device;
     }
     gpu_device->data_avail_epoch = 0;
+    gpu_device->w2r_empty_epoch = UINT64_MAX;
+    gpu_device->w2r_empty_discarded = 0;
+    gpu_device->w2r_skipped = 0;
 
     gpu_device->max_exec_streams = parsec_level_zero_max_streams;
     gpu_device->exec_stream =
