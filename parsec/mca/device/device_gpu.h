@@ -104,6 +104,9 @@ typedef int (parsec_stage_out_function_t)(parsec_gpu_task_t        *gtask,
  * disposal of its wrappers creates them with a custom allocator
  * (passed to PARSEC_OBJ_NEW or PARSEC_OBJ_CONSTRUCT).
  */
+/* parsec_gpu_task_t has nothing_queued, see below */
+#define PARSEC_GPU_TASK_HAS_NOTHING_QUEUED 1
+
 struct parsec_gpu_task_s {
     parsec_list_item_t                     list_item;
     int32_t                                priority; /**< device task priority, inherited from task if < 0 */
@@ -118,6 +121,11 @@ struct parsec_gpu_task_s {
                                                          *   after the push (e.g., a pushout requested when the task
                                                          *   sends its data) were not staged in and hold no reader. */
     int32_t                                last_status;
+    uint8_t                                nothing_queued; /**< set by the submit function when it returns a
+                                                           *   non-negative value without having queued any work on
+                                                           *   the stream: the execution stage then completes without
+                                                           *   recording an event (see parsec_device_skip_empty_events).
+                                                           *   Cleared by the runtime after each submission. */
     const void                            *batch_key; /**< identifies the batch group of the task: tasks with the
                                                        *   same non-NULL key move together through the device
                                                        *   stages and compete for a single batch. If NULL, tasks

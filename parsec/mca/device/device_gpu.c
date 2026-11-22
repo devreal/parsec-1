@@ -3435,10 +3435,19 @@ parsec_device_kernel_exec( parsec_device_gpu_module_t      *gpu_device,
     gpu_task->last_status = rc;
     /* Negative hook returns are scheduler control flow and must be propagated
      * immediately. Non-negative returns mean the submit hook queued GPU work,
-     * so ask the stream progress engine to record an execution event.
+     * so ask the stream progress engine to record an execution event -- unless
+     * the hook reported that it queued nothing (nothing_queued): then there is
+     * nothing to wait for, and the stage completes right away if empty events
+     * are skipped (parsec_device_skip_empty_events).
      */
-    if( rc < 0 )
+    if( rc < 0 ) {
+        gpu_task->nothing_queued = 0;
         return rc;
+    }
+    if( gpu_task->nothing_queued ) {
+        gpu_task->nothing_queued = 0;
+        return 0;
+    }
     return 1;
 }
 
