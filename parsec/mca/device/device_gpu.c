@@ -19,6 +19,10 @@
 
 #include <limits.h>
 #include <threads.h>
+#include <pthread.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #define PARSEC_DEVICE_DATA_COPY_ATOMIC_SENTINEL 1024
 #define PARSEC_DEVICE_CLEAR_EVERY 128
@@ -53,6 +57,97 @@ int32_t parsec_gpu_exec_delay_batch = 1;
  * written back and the device stalled with a full pool. Only the manager (holding the device
  * mutex) touches it. */
 static int active_w2r_tasks[256] = {0};
+
+/*
+ * Split device manager (experimental, PARSEC_GPU_DATA_THREAD=1).
+ *
+ * The manager of a device (the worker holding the device mutex) keeps the execution
+ * streams: submit hooks, batch leaders, AGAIN/BATCH_WAIT, and the release and
+ * scheduling of completed tasks, so the mutex protocol is unchanged. A helper thread
+ * per device (the data thread) owns everything touching the device memory state: the
+ * pending heap, the stage-in stream (reserve, prealloc, transfers), the stage-out
+ * stream, the epilog, cleanout, eviction (w2r) and the memory inbox. Tasks move
+ * between the two through the hand-off queues below. Only the data thread touches the
+ * LRUs and data_avail_epoch while it is enabled.
+ */
+typedef struct parsec_gpu_hq_s {
+    parsec_atomic_lock_t lock;
+    volatile int n;
+    int cap;
+    parsec_gpu_task_t **buf;
+} parsec_gpu_hq_t;
+
+typedef struct parsec_gpu_dthread_s {
+    parsec_device_gpu_module_t *gpu_device;
+    pthread_t thread;
+    volatile int32_t stop;
+    /* data thread -> manager */
+    parsec_gpu_hq_t staged;     /* stage-in completed: ready for the execution streams */
+    parsec_gpu_hq_t finished;   /* stage-out and epilog completed: release and schedule */
+    parsec_gpu_hq_t withdrawn;  /* withdrawn from the device during a data stage */
+    parsec_gpu_hq_t resched;    /* cleaned out after NEXT: release and reschedule */
+    /* manager -> data thread */
+    parsec_gpu_hq_t executed;   /* execution completed: stage out */
+    parsec_gpu_hq_t cleanout;   /* execution returned NEXT: clean out */
+    /* consumer-side buffers, swapped with the queues (one consumer per queue) */
+    parsec_gpu_hq_t m_staged, m_finished, m_withdrawn, m_resched, d_executed, d_cleanout;
+    /* the w2r tasks are allocated from a task mempool owned by the data thread */
+    parsec_mempool_t w2r_mempool;
+    parsec_execution_stream_t *es;
+} parsec_gpu_dthread_t;
+
+static parsec_gpu_dthread_t *parsec_gpu_dthreads[256] = {NULL};
+/* set in the data thread only */
+static __thread parsec_gpu_dthread_t *parsec_gpu_dthread_self = NULL;
+static void parsec_gpu_dthread_stop( parsec_device_gpu_module_t* gpu_device );
+
+static int parsec_gpu_data_thread_enabled(void)
+{
+    static int v = -1;
+    if( v < 0 ) {
+        const char *e = getenv("PARSEC_GPU_DATA_THREAD");
+        v = (NULL != e) ? (atoi(e) != 0) : 0;
+    }
+    return v;
+}
+
+static void parsec_gpu_hq_init(parsec_gpu_hq_t *q)
+{
+    parsec_atomic_lock_init(&q->lock);
+    q->n = 0;
+    q->cap = 0;
+    q->buf = NULL;
+}
+
+static void parsec_gpu_hq_push(parsec_gpu_hq_t *q, parsec_gpu_task_t *t)
+{
+    parsec_atomic_lock(&q->lock);
+    if( q->n == q->cap ) {
+        q->cap = (0 == q->cap) ? 256 : 2 * q->cap;
+        q->buf = (parsec_gpu_task_t**)realloc(q->buf, q->cap * sizeof(parsec_gpu_task_t*));
+    }
+    q->buf[q->n] = t;
+    parsec_atomic_wmb();
+    q->n = q->n + 1;
+    parsec_atomic_unlock(&q->lock);
+}
+
+/* Move the content of @p q into the empty consumer buffer @p local, in FIFO order */
+static bool parsec_gpu_hq_take(parsec_gpu_hq_t *q, parsec_gpu_hq_t *local)
+{
+    parsec_gpu_task_t **buf;
+    int cap;
+
+    assert(0 == local->n);
+    if( 0 == q->n )
+        return false;
+    parsec_atomic_lock(&q->lock);
+    buf = q->buf; q->buf = local->buf; local->buf = buf;
+    cap = q->cap; q->cap = local->cap; local->cap = cap;
+    local->n = q->n; q->n = 0;
+    parsec_atomic_unlock(&q->lock);
+    return local->n > 0;
+}
 
 
 /**
@@ -922,6 +1017,8 @@ int
 parsec_device_memory_release( parsec_device_gpu_module_t* gpu_device )
 {
     int rc;
+
+    parsec_gpu_dthread_stop(gpu_device);
 
     rc = gpu_device->set_device(gpu_device);
     if(PARSEC_SUCCESS != rc)
@@ -2857,6 +2954,11 @@ static void
 parsec_device_release_withdrawn_tasks( parsec_device_gpu_module_t* gpu_device,
                                        parsec_gpu_task_t* ring )
 {
+    if( NULL != parsec_gpu_dthread_self ) {
+        /* the data thread does not touch the mutex: the manager accounts for the tasks */
+        parsec_gpu_hq_push(&parsec_gpu_dthread_self->withdrawn, ring);
+        return;
+    }
     int cnt = parsec_device_release_gpu_tasks(gpu_device, ring);
 
     /* The tasks still managed by the device keep the count positive. Beware:
@@ -3962,6 +4064,327 @@ parsec_gpu_pending_chain_reverse(parsec_list_item_t *chain)
     return prev;
 }
 
+/* Drain the gpu_mem_inbox to reclaim lru elements (manager or data thread only) */
+static inline void
+parsec_device_drain_mem_inbox( parsec_device_gpu_module_t* gpu_device )
+{
+    parsec_gpu_data_copy_t *gpu_copy;
+
+    if( parsec_lifo_is_empty(&gpu_device->gpu_mem_inbox) )
+        return;
+    while( NULL != (gpu_copy = (parsec_gpu_data_copy_t*)parsec_lifo_pop(&gpu_device->gpu_mem_inbox)) ) {
+        PARSEC_LIST_ITEM_SINGLETON(gpu_copy);
+        /* dirty copies (e.g., OWNED copies used as the source of a D2D transfer) must be
+         * written back before they are evicted, so they go to the owned LRU */
+        bool owned = (NULL != gpu_copy->original &&
+                      PARSEC_DATA_COHERENCY_SHARED != gpu_copy->coherency_state);
+        parsec_list_nolock_push_back(owned ? &gpu_device->gpu_mem_owned_lru : &gpu_device->gpu_mem_lru,
+                                     (parsec_list_item_t*)gpu_copy);
+    }
+}
+
+/* Detach the shared pending queue into the heap and pop the next chain of tasks
+ * (a ring of same-batch tasks), or NULL. */
+static parsec_gpu_task_t*
+parsec_device_fetch_pending_chain( parsec_device_gpu_module_t* gpu_device )
+{
+    parsec_gpu_task_t *gpu_task;
+    parsec_list_item_t *chain = parsec_lifo_detach_chain(&gpu_device->pending);
+
+    if( NULL != chain ) {
+        chain = parsec_gpu_pending_chain_reverse(chain);
+        parsec_heap_push_chain(&gpu_device->pending_heap, chain);
+    }
+    gpu_task = (parsec_gpu_task_t*)parsec_heap_pop(&gpu_device->pending_heap);
+    if( NULL == gpu_task )
+        return NULL;
+    gpu_task->last_data_check_epoch = gpu_device->data_avail_epoch - 1;  /* force at least one tour */
+    if( PARSEC_GPU_TASK_TYPE_D2D_COMPLETE == gpu_task->task_type )
+        return gpu_task;
+    int chain_len = 1;
+    bool can_batch = parsec_gpu_task_selected_chore_allows_batch(gpu_task->ec, (parsec_device_module_t*)gpu_device);
+    while( can_batch && chain_len < PARSEC_DEVICE_MAX_BATCH_SIZE ) {
+        parsec_gpu_task_t *candidate = (parsec_gpu_task_t*)parsec_heap_peek(&gpu_device->pending_heap);
+        if( NULL == candidate ||
+            !parsec_gpu_task_same_batch(gpu_task, candidate) ||
+            !parsec_gpu_task_selected_chore_allows_batch(candidate->ec, (parsec_device_module_t*)gpu_device) )
+            break;
+        parsec_heap_pop(&gpu_device->pending_heap);
+        parsec_list_item_ring_push((parsec_list_item_t*)gpu_task, (parsec_list_item_t*)candidate);
+        chain_len++;
+    }
+    return gpu_task;
+}
+
+static void*
+parsec_gpu_dthread_main( void *arg )
+{
+    parsec_gpu_dthread_t *dt = (parsec_gpu_dthread_t*)arg;
+    parsec_device_gpu_module_t *gpu_device = dt->gpu_device;
+    const int dev_idx = gpu_device->super.device_index;
+    const int nexec = gpu_device->num_exec_streams - 2;
+    parsec_gpu_task_t *gpu_task, *progress_task, *iter, *next, *fin;
+    int rc, rr = 0, idle = 0;
+    int clear_device_counter = PARSEC_DEVICE_CLEAR_EVERY;
+
+    parsec_gpu_dthread_self = dt;
+#if defined(__linux__)
+    prctl(PR_SET_TIMERSLACK, 1000UL);  /* 1 us: the idle naps must stay short */
+#endif
+    if( PARSEC_SUCCESS != gpu_device->set_device(gpu_device) ) {
+        parsec_fatal("GPU[%d:%s]: data thread could not set the device", dev_idx, gpu_device->super.name);
+    }
+
+    while( !dt->stop ) {
+        /* The device has work while the manager accounts for tasks, or evictions are in flight */
+        if( gpu_device->mutex <= 0 && 0 == active_w2r_tasks[dev_idx] &&
+            0 == dt->executed.n && 0 == dt->cleanout.n ) {
+            if( ++idle > 4096 ) {
+                struct timespec delay = { .tv_sec = 0, .tv_nsec = 5000 };
+                nanosleep(&delay, NULL);
+            }
+            continue;
+        }
+        idle = 0;
+
+        parsec_device_drain_mem_inbox(gpu_device);
+
+        /* Tasks that returned NEXT from the execution stage */
+        if( parsec_gpu_hq_take(&dt->cleanout, &dt->d_cleanout) ) {
+            for( int i = 0; i < dt->d_cleanout.n; i++ ) {
+                parsec_device_kernel_cleanout(gpu_device, dt->d_cleanout.buf[i]);
+                parsec_gpu_hq_push(&dt->resched, dt->d_cleanout.buf[i]);
+            }
+            dt->d_cleanout.n = 0;
+        }
+        /* Tasks that completed the execution stage go to the stage-out stream */
+        if( parsec_gpu_hq_take(&dt->executed, &dt->d_executed) ) {
+            for( int i = 0; i < dt->d_executed.n; i++ )
+                parsec_gpu_stream_push_pending(gpu_device, gpu_device->exec_stream[1], dt->d_executed.buf[i]);
+            dt->d_executed.n = 0;
+        }
+
+        /* Stage in */
+        gpu_task = parsec_device_fetch_pending_chain(gpu_device);
+        if( (NULL != gpu_task) && (PARSEC_GPU_TASK_TYPE_D2D_COMPLETE == gpu_task->task_type) ) {
+            parsec_gpu_stream_push_pending(gpu_device, gpu_device->exec_stream[1], gpu_task);
+            gpu_task = NULL;
+        }
+        rc = parsec_device_progress_stream( gpu_device, gpu_device->exec_stream[0],
+                                            parsec_device_kernel_push, gpu_task, &progress_task, true );
+        rr = (rr + 1) % nexec;
+        if( rc < 0 ) {
+            if( PARSEC_HOOK_RETURN_ERROR == rc )
+                parsec_fatal("GPU[%d:%s]: stage-in error", dev_idx, gpu_device->super.name);
+            if( PARSEC_HOOK_RETURN_ASYNC == rc ) {
+                parsec_gpu_hq_push(&dt->withdrawn, progress_task);
+            } else if( 0 == parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_owned_lru) ) {
+                /* Out of memory: evict once the next execution stream runs dry (it reads the
+                 * manager's stream state without synchronization, as a hint only) */
+                if( (0 == active_w2r_tasks[dev_idx]) &&
+                    !parsec_device_stream_has_tasks(gpu_device->exec_stream[2 + rr]) ) {
+                    gpu_task = parsec_gpu_create_w2r_task(gpu_device, dt->es);
+                    if( NULL != gpu_task ) {
+                        active_w2r_tasks[dev_idx]++;
+                        parsec_gpu_stream_push_pending(gpu_device, gpu_device->exec_stream[1], gpu_task);
+                    }
+                }
+            }
+        } else if( NULL != progress_task ) {
+            parsec_gpu_hq_push(&dt->staged, progress_task);
+        }
+
+        /* Stage out */
+        rc = parsec_device_progress_stream( gpu_device, gpu_device->exec_stream[1],
+                                            parsec_device_kernel_pop, NULL, &progress_task, true );
+        if( (PARSEC_HOOK_RETURN_ERROR == rc) || (PARSEC_HOOK_RETURN_DISABLE == rc) )
+            parsec_fatal("GPU[%d:%s]: stage-out error", dev_idx, gpu_device->super.name);
+        if( NULL != progress_task ) {
+            fin = NULL;
+            iter = progress_task;
+            do {
+                next = (parsec_gpu_task_t*)parsec_list_item_ring_chop((parsec_list_item_t*)iter);
+                PARSEC_LIST_ITEM_SINGLETON(iter);
+                if( PARSEC_GPU_TASK_TYPE_D2HTRANSFER == iter->task_type ) {
+                    parsec_gpu_complete_w2r_task(gpu_device, iter, dt->es);
+                    active_w2r_tasks[dev_idx]--;
+                    assert(active_w2r_tasks[dev_idx] >= 0);
+                } else {
+                    if( PARSEC_GPU_TASK_TYPE_D2D_COMPLETE != iter->task_type )
+                        parsec_device_kernel_epilog(gpu_device, iter);
+                    parsec_gpu_task_ring_append(&fin, iter);
+                }
+                iter = next;
+            } while( NULL != iter );
+            if( NULL != fin )
+                parsec_gpu_hq_push(&dt->finished, fin);
+        } else if( clear_device_counter-- == 0 ) {
+            parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_owned_lru);
+            parsec_device_memory_release_discarded(gpu_device, &gpu_device->gpu_mem_lru);
+            clear_device_counter = PARSEC_DEVICE_CLEAR_EVERY;
+        }
+    }
+    return NULL;
+}
+
+/* Start the data thread of @p gpu_device if needed. Called by the manager only. */
+static parsec_gpu_dthread_t*
+parsec_gpu_dthread_get( parsec_device_gpu_module_t* gpu_device )
+{
+    int idx = gpu_device->super.device_index;
+    parsec_gpu_dthread_t *dt = parsec_gpu_dthreads[idx];
+
+    if( NULL != dt )
+        return dt;
+    dt = (parsec_gpu_dthread_t*)calloc(1, sizeof(parsec_gpu_dthread_t));
+    dt->gpu_device = gpu_device;
+    parsec_gpu_hq_init(&dt->staged);   parsec_gpu_hq_init(&dt->finished);
+    parsec_gpu_hq_init(&dt->withdrawn); parsec_gpu_hq_init(&dt->resched);
+    parsec_gpu_hq_init(&dt->executed); parsec_gpu_hq_init(&dt->cleanout);
+    parsec_gpu_hq_init(&dt->m_staged); parsec_gpu_hq_init(&dt->m_finished);
+    parsec_gpu_hq_init(&dt->m_withdrawn); parsec_gpu_hq_init(&dt->m_resched);
+    parsec_gpu_hq_init(&dt->d_executed); parsec_gpu_hq_init(&dt->d_cleanout);
+    parsec_mempool_construct(&dt->w2r_mempool, PARSEC_OBJ_CLASS(parsec_task_t), sizeof(parsec_task_t),
+                             offsetof(parsec_task_t, mempool_owner), 1);
+    dt->es = (parsec_execution_stream_t*)calloc(1, sizeof(parsec_execution_stream_t));
+    dt->es->context_mempool = &dt->w2r_mempool.thread_mempools[0];
+    if( 0 != pthread_create(&dt->thread, NULL, parsec_gpu_dthread_main, dt) ) {
+        parsec_fatal("GPU[%d:%s]: could not start the data thread", idx, gpu_device->super.name);
+    }
+    parsec_gpu_dthreads[idx] = dt;
+    parsec_inform("GPU[%d:%s]: split device manager, data thread started", idx, gpu_device->super.name);
+    return dt;
+}
+
+static void
+parsec_gpu_dthread_stop( parsec_device_gpu_module_t* gpu_device )
+{
+    int idx = gpu_device->super.device_index;
+    parsec_gpu_dthread_t *dt = parsec_gpu_dthreads[idx];
+
+    if( NULL == dt )
+        return;
+    dt->stop = 1;
+    pthread_join(dt->thread, NULL);
+    parsec_gpu_dthreads[idx] = NULL;
+    /* the queues are empty: the device is idle */
+    free(dt->staged.buf); free(dt->finished.buf); free(dt->withdrawn.buf); free(dt->resched.buf);
+    free(dt->executed.buf); free(dt->cleanout.buf);
+    free(dt->m_staged.buf); free(dt->m_finished.buf); free(dt->m_withdrawn.buf); free(dt->m_resched.buf);
+    free(dt->d_executed.buf); free(dt->d_cleanout.buf);
+    parsec_mempool_destruct(&dt->w2r_mempool);
+    free(dt->es);
+    free(dt);
+}
+
+/**
+ * Manager loop of the split device manager: progress the execution streams, and
+ * release and schedule the tasks handed back by the data thread. Returns when the
+ * device mutex drops to 0, as the regular manager does.
+ */
+static parsec_hook_return_t
+parsec_device_kernel_scheduler_split( parsec_device_gpu_module_t *gpu_device,
+                                      parsec_execution_stream_t *es,
+                                      parsec_gpu_task_t *gpu_task )
+{
+    parsec_gpu_dthread_t *dt = parsec_gpu_dthread_get(gpu_device);
+    const int nexec = gpu_device->num_exec_streams - 2;
+    parsec_gpu_task_t *progress_task, *iter, *next;
+    parsec_task_t *task_ring, *task;
+    int rc, cnt, rr = 0;
+
+    /* the data thread stages the task in */
+    if( NULL != gpu_task )
+        parsec_lifo_push(&gpu_device->pending, (parsec_list_item_t*)gpu_task);
+
+    while( 1 ) {
+        cnt = 0;
+
+        if( parsec_gpu_hq_take(&dt->staged, &dt->m_staged) ) {
+            for( int i = 0; i < dt->m_staged.n; i++ ) {
+                rr = (rr + 1) % nexec;
+                parsec_gpu_stream_push_pending(gpu_device, gpu_device->exec_stream[2 + rr], dt->m_staged.buf[i]);
+            }
+            dt->m_staged.n = 0;
+        }
+
+        for( int i = 0; i < nexec; i++ ) {
+            parsec_gpu_exec_stream_t *stream = gpu_device->exec_stream[2 + i];
+            parsec_device_stream_take_delayed(gpu_device, stream);
+            rc = parsec_device_progress_stream( gpu_device, stream, parsec_device_kernel_exec,
+                                                NULL, &progress_task, false );
+            if( rc < 0 ) {
+                if( (PARSEC_HOOK_RETURN_DISABLE == rc) || (PARSEC_HOOK_RETURN_ERROR == rc) ) {
+                    parsec_warning("GPU[%d:%s]: Critical issue related to the GPU discovered. Giving up",
+                                   gpu_device->super.device_index, gpu_device->super.name);
+                    return PARSEC_HOOK_RETURN_DISABLE;
+                }
+                if( PARSEC_HOOK_RETURN_ASYNC == rc ) {
+                    cnt += parsec_device_release_gpu_tasks(gpu_device, progress_task);
+                } else if( NULL != progress_task ) {
+                    assert(PARSEC_HOOK_RETURN_NEXT == rc);
+                    parsec_gpu_hq_push(&dt->cleanout, progress_task);
+                }
+                continue;
+            }
+            if( NULL != progress_task )
+                parsec_gpu_hq_push(&dt->executed, progress_task);
+        }
+
+        if( parsec_gpu_hq_take(&dt->resched, &dt->m_resched) ) {
+            for( int i = 0; i < dt->m_resched.n; i++ ) {
+                task = dt->m_resched.buf[i]->ec;
+                /* release the GPU task before its parent task, see parsec_device_release_gpu_tasks() */
+                cnt += parsec_device_release_gpu_tasks(gpu_device, dt->m_resched.buf[i]);
+                __parsec_reschedule(es, task);
+            }
+            dt->m_resched.n = 0;
+        }
+        if( parsec_gpu_hq_take(&dt->withdrawn, &dt->m_withdrawn) ) {
+            for( int i = 0; i < dt->m_withdrawn.n; i++ )
+                cnt += parsec_device_release_gpu_tasks(gpu_device, dt->m_withdrawn.buf[i]);
+            dt->m_withdrawn.n = 0;
+        }
+        if( parsec_gpu_hq_take(&dt->finished, &dt->m_finished) ) {
+            task_ring = NULL;
+            for( int i = 0; i < dt->m_finished.n; i++ ) {
+                iter = dt->m_finished.buf[i];
+                do {
+                    next = (parsec_gpu_task_t*)parsec_list_item_ring_chop((parsec_list_item_t*)iter);
+                    PARSEC_LIST_ITEM_SINGLETON(iter);
+                    task = iter->ec;
+                    bool d2d_complete = (PARSEC_GPU_TASK_TYPE_D2D_COMPLETE == iter->task_type);
+                    cnt += parsec_device_release_gpu_tasks(gpu_device, iter);
+                    if( d2d_complete ) {
+                        free(task);
+                    } else {
+                        task->status = PARSEC_TASK_STATUS_COMPLETE;
+                        gpu_device->super.executed_tasks++;
+                        PARSEC_LIST_ITEM_SINGLETON(task);
+                        if( NULL == task_ring )
+                            task_ring = task;
+                        else
+                            parsec_list_item_ring_push(&task_ring->super, (parsec_list_item_t*)task);
+                    }
+                    iter = next;
+                } while( NULL != iter );
+            }
+            dt->m_finished.n = 0;
+            if( NULL != task_ring )
+                __parsec_schedule(es, task_ring, 1);
+        }
+
+        if( cnt > 0 ) {
+            rc = parsec_atomic_fetch_sub_int32(&gpu_device->mutex, cnt) - cnt;
+            if( 0 == rc ) {
+                PARSEC_DEBUG_VERBOSE(5, parsec_gpu_output_stream, "GPU[%d:%s]: Leaving GPU management",
+                                     gpu_device->super.device_index, gpu_device->super.name);
+                return PARSEC_HOOK_RETURN_ASYNC;
+            }
+        }
+    }
+}
+
 /**
  * This version is based on 4 streams: one for transfers from the memory to
  * the GPU, 2 for kernel executions and one for transfers from the GPU into
@@ -4040,6 +4463,9 @@ parsec_device_kernel_scheduler( parsec_device_module_t *module,
     rc = gpu_device->set_device(gpu_device);
     if(PARSEC_SUCCESS != rc)
         return PARSEC_HOOK_RETURN_DISABLE;
+
+    if( parsec_gpu_data_thread_enabled() )
+        return parsec_device_kernel_scheduler_split(gpu_device, es, gpu_task);
 
  check_in_deps:
 
